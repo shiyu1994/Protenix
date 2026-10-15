@@ -20,6 +20,20 @@ import torch.nn as nn
 from protenix.model import sample_confidence
 
 
+AF3_FIG2D_EVAL_TYPES = frozenset(
+    {
+        "intra_prot",
+        "intra_ligand",
+        "intra_dna",
+        "intra_rna",
+        "prot_prot",
+        "ligand_prot",
+        "dna_prot",
+        "rna_prot",
+    }
+)
+
+
 def get_complex_level_rankers(scores, keys):
     assert all([k in ["plddt", "gpde", "ranking_score"] for k in keys])
     rankers = {}
@@ -89,6 +103,73 @@ class LDDTMetrics(nn.Module):
         )  # [N_sample]
         out["complex"] = lddt
 
+        required_entry_keys = {
+            "eval_type",
+            "chain_1_mask",
+            "chain_2_mask",
+        }
+        if required_entry_keys.issubset(label_dict):
+            entry_scores = []
+            entry_types = []
+            entry_cluster_ids = []
+            eval_types = list(label_dict["eval_type"])
+            cluster_ids = list(
+                label_dict.get("cluster_id", [None] * len(eval_types))
+            )
+            chain_1_masks = label_dict["chain_1_mask"].bool()
+            chain_2_masks = label_dict["chain_2_mask"].bool()
+            lddt_mask = label_dict["lddt_mask"].bool()
+
+            if not (
+                len(eval_types)
+                == len(cluster_ids)
+                == chain_1_masks.size(0)
+                == chain_2_masks.size(0)
+            ):
+                raise ValueError(
+                    "eval_type, cluster_id, chain_1_mask and chain_2_mask "
+                    "must describe the same number of evaluation entries"
+                )
+
+            for eval_type, cluster_id, chain_1_mask, chain_2_mask in zip(
+                eval_types,
+                cluster_ids,
+                chain_1_masks,
+                chain_2_masks,
+            ):
+                eval_type = str(eval_type)
+                if eval_type not in AF3_FIG2D_EVAL_TYPES:
+                    continue
+
+                # LDDT uses a direction-specific inclusion radius: 30 A when
+                # the first atom is nucleotide and 15 A otherwise. Retaining
+                # both interface directions here matches PXMeter/AF3 behavior
+                # for protein-nucleic-acid interfaces.
+                cross_chain_mask = (
+                    chain_1_mask[:, None] & chain_2_mask[None, :]
+                ) | (
+                    chain_2_mask[:, None] & chain_1_mask[None, :]
+                )
+                entry_mask = lddt_mask & cross_chain_mask
+                if not torch.any(entry_mask):
+                    continue
+
+                entry_scores.append(
+                    self.lddt_base.forward(
+                        pred_coordinate=pred_dict["coordinate"],
+                        true_coordinate=label_dict["coordinate"],
+                        lddt_mask=entry_mask,
+                        chunk_size=self.chunk_size,
+                    )
+                )
+                entry_types.append(eval_type)
+                entry_cluster_ids.append(str(cluster_id))
+
+            if entry_scores:
+                out["af3_entries"] = torch.stack(entry_scores, dim=0)
+                out["af3_eval_type"] = entry_types
+                out["af3_cluster_id"] = entry_cluster_ids
+
         return out
 
     def aggregate(
@@ -135,7 +216,50 @@ class LDDTMetrics(nn.Module):
         complex_lddt = {
             f"lddt/complex/{name}": value for name, value in complex_lddt.items()
         }
-        return complex_lddt, {}
+
+        af3_proxy_metrics = {}
+        if "af3_entries" in lddt_dict:
+            entry_scores = lddt_dict["af3_entries"]  # [N_eval, N_sample]
+            n_sample = entry_scores.size(-1)
+            gpde = confidence_scores["gpde"]
+            if gpde.size(0) != n_sample:
+                raise ValueError(
+                    "global PDE sample count does not match LDDT sample count: "
+                    f"{gpde.size(0)} != {n_sample}"
+                )
+            # Protenix stores gPDE as [N_sample, 1]. Be robust to future
+            # trailing dimensions by reducing each sample to one scalar.
+            gpde_per_sample = gpde.reshape(n_sample, -1).mean(dim=-1)
+            gpde_top1_index = torch.argmin(gpde_per_sample)
+
+            top1 = entry_scores[:, gpde_top1_index]
+            best5 = entry_scores.max(dim=-1).values
+            top1_best5 = 0.5 * (top1 + best5)
+            entry_types = lddt_dict["af3_eval_type"]
+
+            for eval_type in sorted(set(entry_types)):
+                type_indices = [
+                    index
+                    for index, entry_type in enumerate(entry_types)
+                    if entry_type == eval_type
+                ]
+                index_tensor = torch.tensor(
+                    type_indices,
+                    dtype=torch.long,
+                    device=entry_scores.device,
+                )
+                prefix = f"lddt/af3_proxy/{eval_type}"
+                af3_proxy_metrics[f"{prefix}/top1_pct"] = (
+                    top1.index_select(0, index_tensor).mean() * 100.0
+                )
+                af3_proxy_metrics[f"{prefix}/best5_pct"] = (
+                    best5.index_select(0, index_tensor).mean() * 100.0
+                )
+                af3_proxy_metrics[f"{prefix}/top1_best5_pct"] = (
+                    top1_best5.index_select(0, index_tensor).mean() * 100.0
+                )
+
+        return {**complex_lddt, **af3_proxy_metrics}, {}
 
 
 class LDDT(nn.Module):

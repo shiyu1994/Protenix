@@ -19,11 +19,13 @@ from typing import Any, Optional, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint  # noqa: F401 - required for torch.utils.checkpoint attribute lookup.
 
 from protenix.model.triangular.layers import LayerNorm, trunc_normal_init_
 from protenix.model.utils import (
     chunk_layer,
     flatten_final_dims,
+    get_checkpoint_fn,
     move_final_dim_to_dim,
     pad_at_dim,
     reshape_at_dim,
@@ -170,12 +172,26 @@ class Transition(nn.Module):
     Args:
         c_in (int): the input dimension.
         n (int): factor by which c_in is multiplied to obtain hidden dimension.
+        train_chunk_size (Optional[int]): chunk size on the penultimate dimension
+            during training. Defaults to None.
+        train_checkpoint_chunks (bool): whether to checkpoint each training chunk.
+            Defaults to False.
     """
 
-    def __init__(self, c_in: int, n: int) -> None:
+    def __init__(
+        self,
+        c_in: int,
+        n: int,
+        train_chunk_size: Optional[int] = None,
+        train_checkpoint_chunks: bool = False,
+    ) -> None:
         super(Transition, self).__init__()
+        if train_chunk_size is not None and train_chunk_size <= 0:
+            raise ValueError("train_chunk_size must be a positive integer or None")
         self.n = n
         self.c_in = c_in
+        self.train_chunk_size = train_chunk_size
+        self.train_checkpoint_chunks = train_checkpoint_chunks
         self.layernorm1 = LayerNorm(c_in)
         self.linear_no_bias_a = LinearNoBias(
             in_features=c_in, out_features=n * c_in, initializer="relu"
@@ -186,6 +202,30 @@ class Transition(nn.Module):
         self.linear_no_bias = LinearNoBias(
             in_features=n * c_in, out_features=c_in, initializer="zeros"
         )
+
+    def _forward_train_no_chunk(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.layernorm1(x)
+        a = self.linear_no_bias_a(x)
+        b = self.linear_no_bias_b(x)
+        x = self.linear_no_bias(F.silu(a) * b)
+        return x
+
+    def _forward_train_chunked(self, x: torch.Tensor) -> torch.Tensor:
+        if self.train_chunk_size is None or x.shape[-2] <= self.train_chunk_size:
+            return self._forward_train_no_chunk(x)
+
+        checkpoint_fn = (
+            get_checkpoint_fn()
+            if self.train_checkpoint_chunks and torch.is_grad_enabled()
+            else None
+        )
+        outputs = []
+        for chunk in torch.split(x, self.train_chunk_size, dim=-2):
+            if checkpoint_fn is None:
+                outputs.append(self._forward_train_no_chunk(chunk))
+            else:
+                outputs.append(checkpoint_fn(self._forward_train_no_chunk, chunk))
+        return torch.cat(outputs, dim=-2)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -198,11 +238,7 @@ class Transition(nn.Module):
                 [..., c]
         """
         if self.training:
-            x = self.layernorm1(x)
-            a = self.linear_no_bias_a(x)
-            b = self.linear_no_bias_b(x)
-            x = self.linear_no_bias(F.silu(a) * b)
-            return x
+            return self._forward_train_chunked(x)
         else:
             other_dims = x.shape[:-1]
             dim_size = x.shape[-1]
@@ -289,6 +325,31 @@ def _attention(
     attn_output = attn_weights.to(dtype=input_dtype) @ v
 
     return attn_output
+
+
+def _build_local_attention_indices(
+    n: int,
+    n_queries: int,
+    n_keys: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build query/key indices and validity mask directly in local blocks."""
+    n_trunks = int(math.ceil(n / n_queries))
+    q_indices = torch.arange(
+        n_trunks * n_queries, device=device, dtype=torch.long
+    ).reshape(n_trunks, n_queries)
+
+    block_starts = (
+        torch.arange(n_trunks, device=device, dtype=torch.long) * n_queries
+    )
+    key_offsets = torch.arange(n_keys, device=device, dtype=torch.long)
+    key_offsets = key_offsets - (n_keys - n_queries) // 2
+    k_indices = block_starts.unsqueeze(-1) + key_offsets.unsqueeze(0)
+
+    q_valid = q_indices < n
+    k_valid = (k_indices >= 0) & (k_indices < n)
+    mask_trunked = q_valid.unsqueeze(-1) & k_valid.unsqueeze(-2)
+    return q_indices, k_indices, mask_trunked
 
 
 def rearrange_qk_to_dense_trunk(
@@ -378,22 +439,15 @@ def rearrange_qk_to_dense_trunk(
     ]
 
     if compute_mask:
-        pad_mask = q[0].new_ones(
-            *(1,) * len(q[0].shape[:-2]),
-            n + q_pad_length,
-            n + pad_left + pad_right,
-            requires_grad=False,
+        _, _, pad_mask_trunked = _build_local_attention_indices(
+            n=n,
+            n_queries=n_queries,
+            n_keys=n_keys,
+            device=q[0].device,
         )
-        pad_mask[..., :n, :pad_left] = 0
-        pad_mask[..., :n, (pad_left + n) :] = 0
-        pad_mask[..., n:, :] = 0
-
-        concat_split_data = optimized_concat_split(pad_mask, n_queries)
-        pad_mask_trunked = (
-            concat_split_data.unfold(
-                -1, n_keys, pad_mask.size(-1) + n_queries
-            ).transpose(-2, -3)
-        ).bool()
+        pad_mask_trunked = pad_mask_trunked.reshape(
+            *(1,) * len(q[0].shape[:-2]), n_trunks, n_queries, n_keys
+        )
     else:
         pad_mask_trunked = None
 
@@ -483,27 +537,45 @@ def rearrange_to_dense_trunk(
         n_keys=n_keys,
         compute_mask=False,
     )
-    q_pad_length, pad_left, pad_right = (
-        padding_info["q_pad"],
-        padding_info["k_pad_left"],
-        padding_info["k_pad_right"],
+    q_pad_length = padding_info["q_pad"]
+    q_indices, k_indices, local_valid = _build_local_attention_indices(
+        n=n,
+        n_queries=n_queries,
+        n_keys=n_keys,
+        device=q.device,
     )
 
-    # Padded_width = n + pad_left + pad_right
     if attn_bias is None:
-        attn_bias = q.new_zeros(
-            *(1,) * len(q.shape[:-2]), n + q_pad_length, n + pad_left + pad_right
+        attn_bias_trunked = q.new_zeros(
+            *(1,) * len(q.shape[:-2]),
+            q_indices.shape[0],
+            n_queries,
+            n_keys,
         )
-        attn_bias[..., :n, 0:pad_left] = -inf
-        attn_bias[..., :n, pad_left + n : :] = -inf
-        attn_bias[..., n::, :] = -inf
+        local_valid = local_valid.reshape(
+            *(1,) * len(q.shape[:-2]),
+            q_indices.shape[0],
+            n_queries,
+            n_keys,
+        )
     else:
-        attn_bias = F.pad(attn_bias, (pad_left, pad_right, 0, q_pad_length), value=-inf)
+        if attn_bias.shape[-2:] != (n, n):
+            raise ValueError(
+                f"attn_bias must end with ({n}, {n}), got {tuple(attn_bias.shape)}"
+            )
+        q_gather = q_indices.clamp(max=n - 1)
+        k_gather = k_indices.clamp(min=0, max=n - 1)
+        attn_bias_trunked = attn_bias[
+            ..., q_gather.unsqueeze(-1), k_gather.unsqueeze(-2)
+        ]
+        local_valid = local_valid.reshape(
+            *(1,) * (attn_bias_trunked.ndim - 3),
+            q_indices.shape[0],
+            n_queries,
+            n_keys,
+        )
 
-    concat_split_data = optimized_concat_split(attn_bias, n_queries)
-    attn_bias_trunked = concat_split_data.unfold(
-        -1, n_keys, attn_bias.shape[-1] + n_queries
-    ).transpose(-2, -3)
+    attn_bias_trunked = attn_bias_trunked.masked_fill(~local_valid, -inf)
     return q_trunked, kv_trunked[0], kv_trunked[1], attn_bias_trunked, q_pad_length
 
 

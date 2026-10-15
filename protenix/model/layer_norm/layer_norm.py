@@ -38,32 +38,50 @@ from torch.nn.parameter import Parameter
 
 
 current_dir = os.path.dirname(__file__)
-build_directory = current_dir if os.access(current_dir, os.W_OK | os.X_OK) else None
+extension_name = "fast_layer_norm_cuda_v2"
 
-# 1. Try to load from current directory first
-sys.path.append(current_dir)
+# Never build into the source checkout. A checked-in/stale shared object may
+# have been compiled against another PyTorch/CUDA ABI, and several torchrun
+# ranks writing the same source directory can corrupt the extension. PyTorch's
+# cache key includes the Python/CUDA environment; the benchmark launcher also
+# points TORCH_EXTENSIONS_DIR at one node-local directory shared by local ranks.
+from torch.utils.cpp_extension import _get_build_directory
+from protenix.model.layer_norm.cache_provenance import (
+    extension_cache_lock,
+    recover_incomplete_cache,
+    validate_existing_cache,
+    validate_loaded_extension,
+)
 
-# 2. If it falls back to PyTorch's cache, we need to add the cache directory to sys.path
-if build_directory is None:
-    from torch.utils.cpp_extension import _get_build_directory
+build_directory = os.environ.get("PROTENIX_LAYER_NORM_BUILD_DIR")
+if build_directory:
+    build_directory = os.path.abspath(os.path.expanduser(build_directory))
+    os.makedirs(build_directory, exist_ok=True)
+else:
+    build_directory = _get_build_directory(extension_name, False)
+if build_directory not in sys.path:
+    sys.path.insert(0, build_directory)
 
-    cache_dir = _get_build_directory("fast_layer_norm_cuda_v2", False)
-    sys.path.append(cache_dir)
+# Hold the lock through provenance publication so another rank never observes
+# a just-built binary before its record exists. Interrupted builds are rebuilt.
+with extension_cache_lock(build_directory):
+    recover_incomplete_cache(build_directory)
+    validate_existing_cache(build_directory)
+    try:
+        fast_layer_norm_cuda_v2 = importlib.import_module(extension_name)
+    except (ImportError, OSError):
+        from protenix.model.layer_norm.torch_ext_compile import compile
 
-try:
-    fast_layer_norm_cuda_v2 = importlib.import_module("fast_layer_norm_cuda_v2")
-except ImportError:
-    from protenix.model.layer_norm.torch_ext_compile import compile
-
-    fast_layer_norm_cuda_v2 = compile(
-        name="fast_layer_norm_cuda_v2",
-        sources=[
-            os.path.join(f"{current_dir}/kernel", file)
-            for file in ["layer_norm_cuda.cpp", "layer_norm_cuda_kernel.cu"]
-        ],
-        extra_include_paths=[f"{current_dir}/kernel"],
-        build_directory=build_directory,
-    )
+        fast_layer_norm_cuda_v2 = compile(
+            name=extension_name,
+            sources=[
+                os.path.join(f"{current_dir}/kernel", file)
+                for file in ["layer_norm_cuda.cpp", "layer_norm_cuda_kernel.cu"]
+            ],
+            extra_include_paths=[f"{current_dir}/kernel"],
+            build_directory=build_directory,
+        )
+    validate_loaded_extension(build_directory, fast_layer_norm_cuda_v2)
 
 
 class FusedLayerNormAffineFunction(torch.autograd.Function):

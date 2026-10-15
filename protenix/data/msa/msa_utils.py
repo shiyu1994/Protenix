@@ -13,7 +13,8 @@
 # limitations under the License.
 import re
 import string
-from collections.abc import Mapping, MutableMapping, Sequence
+from collections.abc import Iterable, Mapping, MutableMapping, Sequence
+from io import StringIO
 from typing import Any, List, Optional, Set, Tuple
 
 import numpy as np
@@ -53,7 +54,61 @@ class MSACore:
     """Basic MSA parsing and numerical conversion operations."""
 
     @staticmethod
-    def parse_fasta(fasta_str: str) -> Tuple[List[str], List[str]]:
+    def parse_fasta_lines(
+        lines: Iterable[str],
+        depth_limit: Optional[int] = None,
+    ) -> Tuple[List[str], List[str]]:
+        """Parse a FASTA/A3M record prefix without consuming the tail."""
+        if depth_limit is not None:
+            if isinstance(depth_limit, (bool, np.bool_)) or not isinstance(
+                depth_limit,
+                (int, np.integer),
+            ):
+                raise TypeError(
+                    "depth_limit must be a positive integer or None, got "
+                    f"{depth_limit!r}"
+                )
+            depth_limit = int(depth_limit)
+            if depth_limit < 1:
+                raise ValueError(
+                    f"depth_limit must be >= 1, got {depth_limit}"
+                )
+
+        sequences: List[str] = []
+        descriptions: List[str] = []
+        current_description: Optional[str] = None
+        current_sequence: List[str] = []
+
+        def flush_current() -> bool:
+            if current_description is None:
+                return False
+            descriptions.append(current_description)
+            sequences.append("".join(current_sequence))
+            return (
+                depth_limit is not None
+                and len(sequences) >= depth_limit
+            )
+
+        for raw_line in lines:
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith(">"):
+                if flush_current():
+                    return sequences, descriptions
+                current_description = line[1:]
+                current_sequence = []
+            elif current_description is not None:
+                current_sequence.append(line)
+
+        flush_current()
+        return sequences, descriptions
+
+    @staticmethod
+    def parse_fasta(
+        fasta_str: str,
+        depth_limit: Optional[int] = None,
+    ) -> Tuple[List[str], List[str]]:
         """
         Parses a FASTA/A3M format string into sequences and descriptions.
 
@@ -63,7 +118,12 @@ class MSACore:
         Returns:
             A tuple of (list of sequences, list of descriptions).
         """
-        return parse_fasta(fasta_str)
+        if depth_limit is None:
+            return parse_fasta(fasta_str)
+        return MSACore.parse_fasta_lines(
+            StringIO(fasta_str),
+            depth_limit=depth_limit,
+        )
 
     @staticmethod
     def sequences_to_array(
@@ -138,47 +198,252 @@ class RawMsa:
         sequences: Sequence[str],
         descriptions: Sequence[str],
         deduplicate: bool = True,
+        precomputed_deletion_matrix: Optional[np.ndarray] = None,
+        depth_limit: Optional[int] = None,
     ) -> None:
         self.query = query
         self.chain_type = chain_type
-        if deduplicate:
-            self.seqs, self.descs = self._deduplicate_sequences(sequences, descriptions)
-        else:
-            self.seqs, self.descs = list(sequences), list(descriptions)
-
-        # Make sure the MSA always has at least the query.
-        self.seqs = self.seqs or [query]
-        self.descs = self.descs or ["Original query"]
-
-        if not self._verify_query():
+        input_sequences = list(sequences)
+        input_descriptions = list(descriptions)
+        if len(input_sequences) != len(input_descriptions):
             raise ValueError(
-                f"MSA query/size mismatch for {chain_type}, falling back to query only."
+                "MSA sequences and descriptions must have the same length: "
+                f"{len(input_sequences)} != {len(input_descriptions)}"
             )
 
+        deletion_matrix = None
+        if precomputed_deletion_matrix is not None:
+            deletion_matrix = np.asarray(precomputed_deletion_matrix)
+            if deletion_matrix.ndim != 2:
+                raise ValueError(
+                    "precomputed_deletion_matrix must be rank 2, got "
+                    f"shape {deletion_matrix.shape}"
+                )
+            if deletion_matrix.shape[0] != len(input_sequences):
+                raise ValueError(
+                    "precomputed_deletion_matrix depth does not match MSA "
+                    f"sequences: {deletion_matrix.shape[0]} != "
+                    f"{len(input_sequences)}"
+                )
+            if not np.issubdtype(deletion_matrix.dtype, np.integer):
+                raise TypeError(
+                    "precomputed_deletion_matrix must have integer dtype, got "
+                    f"{deletion_matrix.dtype}"
+                )
+            if np.any(deletion_matrix < 0):
+                raise ValueError(
+                    "precomputed_deletion_matrix contains negative values"
+                )
+
+        if depth_limit is not None:
+            if isinstance(depth_limit, (bool, np.bool_)) or not isinstance(
+                depth_limit,
+                (int, np.integer),
+            ):
+                raise TypeError(
+                    "depth_limit must be a positive integer or None, got "
+                    f"{depth_limit!r}"
+                )
+            depth_limit = int(depth_limit)
+            if depth_limit < 1:
+                raise ValueError(
+                    f"depth_limit must be >= 1, got {depth_limit}"
+                )
+            input_sequences = input_sequences[:depth_limit]
+            input_descriptions = input_descriptions[:depth_limit]
+            if deletion_matrix is not None:
+                deletion_matrix = deletion_matrix[:depth_limit]
+
+        if deduplicate:
+            keep_indices = self._deduplicate_indices(input_sequences)
+            self.seqs = [input_sequences[i] for i in keep_indices]
+            self.descs = [input_descriptions[i] for i in keep_indices]
+            if deletion_matrix is not None:
+                deletion_matrix = deletion_matrix[keep_indices]
+        else:
+            self.seqs, self.descs = input_sequences, input_descriptions
+
+        # Make sure the MSA always has at least the query.
+        if not self.seqs:
+            self.seqs = [query]
+            self.descs = ["Original query"]
+            if deletion_matrix is not None:
+                deletion_matrix = np.zeros(
+                    (1, len(query)),
+                    dtype=deletion_matrix.dtype,
+                )
+
+        self._precomputed_deletion_matrix = deletion_matrix
+        self._deduplicated = bool(deduplicate)
+
+        if not self._verify_query():
+            logger.warning(
+                "MSA first row does not match the canonical query for %s; "
+                "falling back to query only.",
+                chain_type,
+            )
+            self.seqs = [query]
+            self.descs = ["Original query"]
+            if self._precomputed_deletion_matrix is not None:
+                self._precomputed_deletion_matrix = np.zeros(
+                    (1, len(query)),
+                    dtype=self._precomputed_deletion_matrix.dtype,
+                )
+
+    @staticmethod
+    def _sequence_feature_ids(
+        sequence: str,
+        chain_type: str,
+    ) -> Optional[List[int]]:
+        """Encode one A3M row, ignoring only lowercase insertion residues."""
+        char_maps = {
+            PROTEIN_CHAIN: MSA_PROTEIN_SEQ_TO_ID,
+            DNA_CHAIN: MSA_DNA_SEQ_TO_ID,
+            RNA_CHAIN: MSA_RNA_SEQ_TO_ID,
+        }
+        char_map = char_maps.get(chain_type)
+        if char_map is None:
+            return None
+
+        feature_ids = []
+        for residue in sequence:
+            if residue in char_map:
+                feature_ids.append(char_map[residue])
+            elif residue not in string.ascii_lowercase:
+                return None
+        return feature_ids
+
     def _verify_query(self) -> bool:
-        """Ensures the first sequence in the MSA is equivalent to the query sequence."""
+        """Ensure row zero is feature-equivalent to the canonical query."""
         if self.chain_type not in STANDARD_POLYMER_CHAIN_TYPES:
             return self.seqs[0] == self.query
-        q_arr, _ = MSACore.sequences_to_array([self.query], self.chain_type)
-        m_arr, _ = MSACore.sequences_to_array([self.seqs[0]], self.chain_type)
-        # Only check the shape in case the query (the first sequence in the MSA)
-        # is not explicitly included in the A3M file provided by the user.
-        return np.array_equal(q_arr.shape, m_arr.shape)
+        query_ids = self._sequence_feature_ids(self.query, self.chain_type)
+        row_zero_ids = self._sequence_feature_ids(
+            self.seqs[0],
+            self.chain_type,
+        )
+        return query_ids is not None and query_ids == row_zero_ids
+
+    @staticmethod
+    def _deduplicate_indices(seqs: Sequence[str]) -> List[int]:
+        """Return first-occurrence indices, ignoring insertion characters."""
+        keep_indices, seen = [], set()
+        table = str.maketrans("", "", string.ascii_lowercase)
+        for index, sequence in enumerate(seqs):
+            stripped = sequence.translate(table)
+            if stripped not in seen:
+                seen.add(stripped)
+                keep_indices.append(index)
+        return keep_indices
 
     @staticmethod
     def _deduplicate_sequences(
         seqs: Sequence[str], descs: Sequence[str]
     ) -> Tuple[List[str], List[str]]:
         """Removes duplicate sequences, ignoring insertions (lowercase characters)."""
-        u_seqs, u_descs, seen = [], [], set()
-        table = str.maketrans("", "", string.ascii_lowercase)
-        for s, d in zip(seqs, descs):
-            stripped = s.translate(table)
-            if stripped not in seen:
-                seen.add(stripped)
-                u_seqs.append(s)
-                u_descs.append(d)
-        return u_seqs, u_descs
+        keep_indices = RawMsa._deduplicate_indices(seqs)
+        return (
+            [seqs[i] for i in keep_indices],
+            [descs[i] for i in keep_indices],
+        )
+
+    @classmethod
+    def from_aligned_arrays(
+        cls,
+        query: str,
+        ctype: str,
+        msa: np.ndarray,
+        deletion_matrix: np.ndarray,
+        descriptions: Sequence[str],
+        dedup: bool = True,
+        depth_limit: Optional[int] = None,
+    ) -> "RawMsa":
+        """Construct an MSA while preserving an existing deletion matrix.
+
+        OpenFold3 alignment archives store an aligned ``N x L`` character
+        matrix and the corresponding deletion counts separately.  Converting
+        these arrays through A3M would discard insertion counts, so this
+        constructor keeps them as authoritative numerical input.
+        """
+        msa = np.asarray(msa)
+        deletion_matrix = np.asarray(deletion_matrix)
+        if msa.ndim != 2:
+            raise ValueError(f"msa must be rank 2, got shape {msa.shape}")
+        if deletion_matrix.shape != msa.shape:
+            raise ValueError(
+                "deletion_matrix must match msa shape: "
+                f"{deletion_matrix.shape} != {msa.shape}"
+            )
+        if msa.shape[0] == 0:
+            raise ValueError("msa must contain at least the query row")
+        if msa.dtype.kind not in {"S", "U"}:
+            raise TypeError(
+                f"msa must contain byte or Unicode characters, got {msa.dtype}"
+            )
+
+        if depth_limit is not None:
+            if isinstance(depth_limit, (bool, np.bool_)) or not isinstance(
+                depth_limit,
+                (int, np.integer),
+            ):
+                raise TypeError(
+                    "depth_limit must be a positive integer or None, got "
+                    f"{depth_limit!r}"
+                )
+            depth_limit = int(depth_limit)
+            if depth_limit < 1:
+                raise ValueError(
+                    f"depth_limit must be >= 1, got {depth_limit}"
+                )
+            msa = msa[:depth_limit]
+            # Keep only a compact prefix. A view would retain the full
+            # decompressed OpenFold payload through its ``base`` reference,
+            # defeating the memory benefit of the training depth limit.
+            deletion_matrix = deletion_matrix[:depth_limit].copy()
+            descriptions = descriptions[:depth_limit]
+
+        if msa.dtype.kind == "S" and msa.dtype.itemsize != 1:
+            raise ValueError(
+                f"byte-string msa entries must have width 1, got {msa.dtype}"
+            )
+        if (
+            msa.dtype.kind == "U"
+            and msa.dtype.itemsize != np.dtype("<U1").itemsize
+        ):
+            raise ValueError(
+                f"Unicode msa entries must have width 1, got {msa.dtype}"
+            )
+        empty_value = b"" if msa.dtype.kind == "S" else ""
+        if np.any(msa == empty_value):
+            raise ValueError("msa entries must each contain exactly one character")
+
+        sequences = [
+            "".join(row.tolist())
+            for row in msa.astype("<U1", copy=False)
+        ]
+        query_encoded, _ = MSACore.sequences_to_array([query], ctype)
+        row_zero_encoded, _ = MSACore.sequences_to_array(
+            [sequences[0]],
+            ctype,
+        )
+        if not np.array_equal(query_encoded, row_zero_encoded):
+            raise ValueError(
+                "alignment query row does not match the canonical sequence"
+            )
+        if deletion_matrix.shape[1] != query_encoded.shape[1]:
+            raise ValueError(
+                "alignment width does not match the canonical sequence: "
+                f"{deletion_matrix.shape[1]} != {query_encoded.shape[1]}"
+            )
+
+        return cls(
+            query,
+            ctype,
+            sequences,
+            [str(description) for description in descriptions],
+            deduplicate=dedup,
+            precomputed_deletion_matrix=deletion_matrix,
+        )
 
     @classmethod
     def from_a3m(
@@ -202,13 +467,42 @@ class RawMsa:
         Returns:
             An instance of RawMsa.
         """
-        s, d = MSACore.parse_fasta(a3m)
-        if depth_limit and 0 < depth_limit < len(s):
-            s, d = s[:depth_limit], d[:depth_limit]
+        s, d = MSACore.parse_fasta(
+            a3m,
+            depth_limit=depth_limit,
+        )
         return cls(query, ctype, s, d, dedup)
 
     @classmethod
-    def merge(cls, msas: Sequence["RawMsa"], deduplicate: bool = True) -> "RawMsa":
+    def from_a3m_file(
+        cls,
+        query: str,
+        ctype: str,
+        path: Any,
+        depth_limit: Optional[int] = None,
+        dedup: bool = True,
+    ) -> "RawMsa":
+        """Construct an MSA without reading records beyond the top-N prefix."""
+        with open(path, "r", encoding="utf-8") as handle:
+            sequences, descriptions = MSACore.parse_fasta_lines(
+                handle,
+                depth_limit=depth_limit,
+            )
+        return cls(
+            query,
+            ctype,
+            sequences,
+            descriptions,
+            deduplicate=dedup,
+        )
+
+    @classmethod
+    def merge(
+        cls,
+        msas: Sequence["RawMsa"],
+        deduplicate: bool = True,
+        depth_limit: Optional[int] = None,
+    ) -> "RawMsa":
         """
         Merges multiple RawMsa objects into one.
 
@@ -224,12 +518,68 @@ class RawMsa:
         """
         if not msas:
             raise ValueError("No MSAs provided for merging.")
+        if depth_limit is not None:
+            if isinstance(depth_limit, (bool, np.bool_)) or not isinstance(
+                depth_limit,
+                (int, np.integer),
+            ):
+                raise TypeError(
+                    "depth_limit must be a positive integer or None, got "
+                    f"{depth_limit!r}"
+                )
+            depth_limit = int(depth_limit)
+            if depth_limit < 1:
+                raise ValueError(
+                    f"depth_limit must be >= 1, got {depth_limit}"
+                )
+        query = msas[0].query
+        chain_type = msas[0].chain_type
+        if any(m.query != query or m.chain_type != chain_type for m in msas):
+            raise ValueError("Cannot merge MSAs with different queries or chain types")
+
+        sequences = [sequence for msa in msas for sequence in msa.seqs]
+        descriptions = [description for msa in msas for description in msa.descs]
+        deletion_matrix = None
+        if any(msa._precomputed_deletion_matrix is not None for msa in msas):
+            deletion_matrices = [
+                (
+                    msa._precomputed_deletion_matrix
+                    if msa._precomputed_deletion_matrix is not None
+                    else msa.featurize()["deletion_matrix"]
+                )
+                for msa in msas
+            ]
+            deletion_matrix = np.concatenate(
+                deletion_matrices,
+                axis=0,
+            )
         return cls(
-            msas[0].query,
-            msas[0].chain_type,
-            [s for m in msas for s in m.seqs],
-            [d for m in msas for d in m.descs],
+            query,
+            chain_type,
+            sequences,
+            descriptions,
             deduplicate,
+            precomputed_deletion_matrix=deletion_matrix,
+            depth_limit=depth_limit,
+        )
+
+    def shuffled_hits_preserving_query(self) -> "RawMsa":
+        """Return a copy with hit rows shuffled and query row fixed."""
+        if len(self.seqs) <= 2:
+            return self
+        hit_indices = np.arange(1, len(self.seqs))
+        np.random.shuffle(hit_indices)
+        order = np.concatenate(
+            [np.zeros(1, dtype=np.int64), hit_indices]
+        )
+        deletion_matrix = self.featurize()["deletion_matrix"][order]
+        return RawMsa(
+            self.query,
+            self.chain_type,
+            [self.seqs[i] for i in order],
+            [self.descs[i] for i in order],
+            deduplicate=False,
+            precomputed_deletion_matrix=deletion_matrix,
         )
 
     @property
@@ -245,6 +595,17 @@ class RawMsa:
             A mutable dictionary of MSA features.
         """
         msa_arr, del_arr = MSACore.sequences_to_array(self.seqs, self.chain_type)
+        if self._precomputed_deletion_matrix is not None:
+            if self._precomputed_deletion_matrix.shape != msa_arr.shape:
+                raise ValueError(
+                    "precomputed deletion matrix no longer matches encoded MSA: "
+                    f"{self._precomputed_deletion_matrix.shape} != "
+                    f"{msa_arr.shape}"
+                )
+            del_arr = self._precomputed_deletion_matrix.astype(
+                np.int32,
+                copy=False,
+            )
         return {
             "msa": msa_arr,
             "deletion_matrix": del_arr,

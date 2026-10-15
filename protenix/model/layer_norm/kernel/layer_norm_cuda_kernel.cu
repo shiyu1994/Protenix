@@ -231,6 +231,8 @@ __global__ void LayerNormForwardV2(T* input, T* output, T* gamma, T* beta,
 void cuda_layer_norm(at::Tensor* output, at::Tensor* mean, at::Tensor* invvar, at::Tensor* input,
                      int rows, int cols, at::IntArrayRef normalized_shape, at::Tensor* gamma,
                      at::Tensor* beta, double epsilon) {
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+
     // Get element byte size
     const auto dtype = output->dtype();
     int element_size;
@@ -268,7 +270,7 @@ void cuda_layer_norm(at::Tensor* output, at::Tensor* mean, at::Tensor* invvar, a
     // Type dispatch
     if (dtype == torch::kFloat32) {
         if (vec_size == 16) {
-            LayerNormForwardV2<float, float4><<<grid, block>>>(
+            LayerNormForwardV2<float, float4><<<grid, block, 0, stream>>>(
                 static_cast<float*>(input->data_ptr()),
                 static_cast<float*>(output->data_ptr()),
                 gamma ? static_cast<float*>(gamma->data_ptr()) : nullptr,
@@ -278,7 +280,7 @@ void cuda_layer_norm(at::Tensor* output, at::Tensor* mean, at::Tensor* invvar, a
                 long(rows), long(cols), float(epsilon)
             );
         } else if (vec_size == 8) {
-            LayerNormForwardV2<float, float2><<<grid, block>>>(
+            LayerNormForwardV2<float, float2><<<grid, block, 0, stream>>>(
                 static_cast<float*>(input->data_ptr()),
                 static_cast<float*>(output->data_ptr()),
                 gamma ? static_cast<float*>(gamma->data_ptr()) : nullptr,
@@ -288,7 +290,7 @@ void cuda_layer_norm(at::Tensor* output, at::Tensor* mean, at::Tensor* invvar, a
                 long(rows), long(cols), float(epsilon)
             );
         } else if (vec_size == 4) {
-            LayerNormForwardV2<float, float><<<grid, block>>>(
+            LayerNormForwardV2<float, float><<<grid, block, 0, stream>>>(
                 static_cast<float*>(input->data_ptr()),
                 static_cast<float*>(output->data_ptr()),
                 gamma ? static_cast<float*>(gamma->data_ptr()) : nullptr,
@@ -301,7 +303,7 @@ void cuda_layer_norm(at::Tensor* output, at::Tensor* mean, at::Tensor* invvar, a
     }
     else if (dtype == torch::kFloat16) {
                 if (vec_size == 16) {  // Use float4 to handle half type (8 elements)
-            LayerNormForwardV2<at::Half, float4><<<grid, block>>>(
+            LayerNormForwardV2<at::Half, float4><<<grid, block, 0, stream>>>(
                 static_cast<at::Half*>(input->data_ptr()),
                 static_cast<at::Half*>(output->data_ptr()),
                 gamma ? static_cast<at::Half*>(gamma->data_ptr()) : nullptr,
@@ -311,7 +313,7 @@ void cuda_layer_norm(at::Tensor* output, at::Tensor* mean, at::Tensor* invvar, a
                 long(rows), long(cols), float(epsilon)
             );
         } else if (vec_size == 8) {  // float2 to handle 4 half elements
-            LayerNormForwardV2<at::Half, float2><<<grid, block>>>(
+            LayerNormForwardV2<at::Half, float2><<<grid, block, 0, stream>>>(
                 static_cast<at::Half*>(input->data_ptr()),
                 static_cast<at::Half*>(output->data_ptr()),
                 gamma ? static_cast<at::Half*>(gamma->data_ptr()) : nullptr,
@@ -321,7 +323,7 @@ void cuda_layer_norm(at::Tensor* output, at::Tensor* mean, at::Tensor* invvar, a
                 long(rows), long(cols), float(epsilon)
             );
         } else if (vec_size == 4) {  // float to handle 2 half elements
-            LayerNormForwardV2<at::Half, float><<<grid, block>>>(
+            LayerNormForwardV2<at::Half, float><<<grid, block, 0, stream>>>(
                 static_cast<at::Half*>(input->data_ptr()),
                 static_cast<at::Half*>(output->data_ptr()),
                 gamma ? static_cast<at::Half*>(gamma->data_ptr()) : nullptr,
@@ -331,7 +333,7 @@ void cuda_layer_norm(at::Tensor* output, at::Tensor* mean, at::Tensor* invvar, a
                 long(rows), long(cols), float(epsilon)
             );
         } else if (vec_size == 2) {
-            LayerNormForwardV2<at::Half, at::Half><<<grid, block>>>(
+            LayerNormForwardV2<at::Half, at::Half><<<grid, block, 0, stream>>>(
                 static_cast<at::Half*>(input->data_ptr()),
                 static_cast<at::Half*>(output->data_ptr()),
                 gamma ? static_cast<at::Half*>(gamma->data_ptr()) : nullptr,
@@ -344,7 +346,7 @@ void cuda_layer_norm(at::Tensor* output, at::Tensor* mean, at::Tensor* invvar, a
     }
     else if (dtype == torch::kBFloat16) {
         if (vec_size == 16) {
-            LayerNormForwardV2<at::BFloat16, float4><<<grid, block>>>(
+            LayerNormForwardV2<at::BFloat16, float4><<<grid, block, 0, stream>>>(
                 static_cast<at::BFloat16*>(input->data_ptr()),
                 static_cast<at::BFloat16*>(output->data_ptr()),
                 gamma ? static_cast<at::BFloat16*>(gamma->data_ptr()) : nullptr,
@@ -354,7 +356,7 @@ void cuda_layer_norm(at::Tensor* output, at::Tensor* mean, at::Tensor* invvar, a
                 long(rows), long(cols), float(epsilon)
             );
         } else if (vec_size == 8) {
-            LayerNormForwardV2<at::BFloat16, float2><<<grid, block>>>(
+            LayerNormForwardV2<at::BFloat16, float2><<<grid, block, 0, stream>>>(
                 static_cast<at::BFloat16*>(input->data_ptr()),
                 static_cast<at::BFloat16*>(output->data_ptr()),
                 gamma ? static_cast<at::BFloat16*>(gamma->data_ptr()) : nullptr,
@@ -364,7 +366,7 @@ void cuda_layer_norm(at::Tensor* output, at::Tensor* mean, at::Tensor* invvar, a
                 long(rows), long(cols), float(epsilon)
             );
         } else if (vec_size == 4) {
-            LayerNormForwardV2<at::BFloat16, float><<<grid, block>>>(
+            LayerNormForwardV2<at::BFloat16, float><<<grid, block, 0, stream>>>(
                 static_cast<at::BFloat16*>(input->data_ptr()),
                 static_cast<at::BFloat16*>(output->data_ptr()),
                 gamma ? static_cast<at::BFloat16*>(gamma->data_ptr()) : nullptr,
@@ -374,7 +376,7 @@ void cuda_layer_norm(at::Tensor* output, at::Tensor* mean, at::Tensor* invvar, a
                 long(rows), long(cols), float(epsilon)
             );
         } else if (vec_size == 2) {
-            LayerNormForwardV2<at::BFloat16, at::BFloat16><<<grid, block>>>(
+            LayerNormForwardV2<at::BFloat16, at::BFloat16><<<grid, block, 0, stream>>>(
                 static_cast<at::BFloat16*>(input->data_ptr()),
                 static_cast<at::BFloat16*>(output->data_ptr()),
                 gamma ? static_cast<at::BFloat16*>(gamma->data_ptr()) : nullptr,
@@ -561,40 +563,42 @@ __global__ void LayerNormParamGradStep2(const float* part_grad_gamma, const floa
     SharedMemory<float> shared;
     float* buf = shared.getPointer();
     int i2 = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i2 < col) {
+    const bool column_is_valid = i2 < col;
+    float sum_gamma = float(0);
+    float sum_beta = float(0);
+    if (column_is_valid) {
         // each warp does sequential reductions until reduced part_size is num_warps
         // int num_warp_reductions = part_size / blockDim.y;
-        float sum_gamma = float(0);
-        float sum_beta = float(0);
         const float* part_grad_gamma_ptr = part_grad_gamma + i2;
         const float* part_grad_beta_ptr = part_grad_beta + i2;
         for (int row_idx = threadIdx.y; row_idx < part_size; row_idx += blockDim.y) {
             sum_gamma += part_grad_gamma_ptr[row_idx * col];
             sum_beta += part_grad_beta_ptr[row_idx * col];
         }
-        // inter-warp reductions
-        const int nbsize3 = blockDim.x * blockDim.y / 2;
-        for (int offset = blockDim.y / 2; offset >= 1; offset /= 2) {
-            // top half write to shared memory
-            if (threadIdx.y >= offset && threadIdx.y < 2 * offset) {
-                const int write_idx = (threadIdx.y - offset) * blockDim.x + threadIdx.x;
-                buf[write_idx] = sum_gamma;
-                buf[write_idx + nbsize3] = sum_beta;
-            }
-            __syncthreads();
-            // bottom half sums
-            if (threadIdx.y < offset) {
-                const int read_idx = threadIdx.y * blockDim.x + threadIdx.x;
-                sum_gamma += buf[read_idx];
-                sum_beta += buf[read_idx + nbsize3];
-            }
-            __syncthreads();
+    }
+    // Every thread must execute every barrier, including inactive x lanes in
+    // the final block when col is not a multiple of blockDim.x.
+    const int nbsize3 = blockDim.x * blockDim.y / 2;
+    for (int offset = blockDim.y / 2; offset >= 1; offset /= 2) {
+        // top half write to shared memory
+        if (column_is_valid && threadIdx.y >= offset && threadIdx.y < 2 * offset) {
+            const int write_idx = (threadIdx.y - offset) * blockDim.x + threadIdx.x;
+            buf[write_idx] = sum_gamma;
+            buf[write_idx + nbsize3] = sum_beta;
         }
-        // write out fully summed gradients
-        if (threadIdx.y == 0) {
-            grad_gamma[i2] = sum_gamma;
-            grad_beta[i2] = sum_beta;
+        __syncthreads();
+        // bottom half sums
+        if (column_is_valid && threadIdx.y < offset) {
+            const int read_idx = threadIdx.y * blockDim.x + threadIdx.x;
+            sum_gamma += buf[read_idx];
+            sum_beta += buf[read_idx + nbsize3];
         }
+        __syncthreads();
+    }
+    // write out fully summed gradients
+    if (column_is_valid && threadIdx.y == 0) {
+        grad_gamma[i2] = sum_gamma;
+        grad_beta[i2] = sum_beta;
     }
 }
 
@@ -604,33 +608,35 @@ __global__ void LayerNormGammaGradStep2(const float* part_grad_gamma, const int 
     SharedMemory<float> shared;
     float* buf = shared.getPointer();
     int i2 = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i2 < col) {
+    const bool column_is_valid = i2 < col;
+    float sum_gamma = float(0);
+    if (column_is_valid) {
         // each warp does sequential reductions until reduced part_size is num_warps
         // int num_warp_reductions = part_size / blockDim.y;
-        float sum_gamma = float(0);
         const float* part_grad_gamma_ptr = part_grad_gamma + i2;
         for (int row_idx = threadIdx.y; row_idx < part_size; row_idx += blockDim.y) {
             sum_gamma += part_grad_gamma_ptr[row_idx * col];
         }
-        // inter-warp reductions
-        for (int offset = blockDim.y / 2; offset >= 1; offset /= 2) {
-            // top half write to shared memory
-            if (threadIdx.y >= offset && threadIdx.y < 2 * offset) {
-                const int write_idx = (threadIdx.y - offset) * blockDim.x + threadIdx.x;
-                buf[write_idx] = sum_gamma;
-            }
-            __syncthreads();
-            // bottom half sums
-            if (threadIdx.y < offset) {
-                const int read_idx = threadIdx.y * blockDim.x + threadIdx.x;
-                sum_gamma += buf[read_idx];
-            }
-            __syncthreads();
+    }
+    // Every thread must execute every barrier, including inactive x lanes in
+    // the final block when col is not a multiple of blockDim.x.
+    for (int offset = blockDim.y / 2; offset >= 1; offset /= 2) {
+        // top half write to shared memory
+        if (column_is_valid && threadIdx.y >= offset && threadIdx.y < 2 * offset) {
+            const int write_idx = (threadIdx.y - offset) * blockDim.x + threadIdx.x;
+            buf[write_idx] = sum_gamma;
         }
-        // write out fully summed gradients
-        if (threadIdx.y == 0) {
-            grad_gamma[i2] = sum_gamma;
+        __syncthreads();
+        // bottom half sums
+        if (column_is_valid && threadIdx.y < offset) {
+            const int read_idx = threadIdx.y * blockDim.x + threadIdx.x;
+            sum_gamma += buf[read_idx];
         }
+        __syncthreads();
+    }
+    // write out fully summed gradients
+    if (column_is_valid && threadIdx.y == 0) {
+        grad_gamma[i2] = sum_gamma;
     }
 }
 
@@ -640,33 +646,35 @@ __global__ void LayerNormBetaGradStep2(const float* part_grad_beta, const int pa
     SharedMemory<float> shared;
     float* buf = shared.getPointer();
     int i2 = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i2 < col) {
+    const bool column_is_valid = i2 < col;
+    float sum_beta = float(0);
+    if (column_is_valid) {
         // each warp does sequential reductions until reduced part_size is num_warps
         // int num_warp_reductions = part_size / blockDim.y;
-        float sum_beta = float(0);
         const float* part_grad_beta_ptr = part_grad_beta + i2;
         for (int row_idx = threadIdx.y; row_idx < part_size; row_idx += blockDim.y) {
             sum_beta += part_grad_beta_ptr[row_idx * col];
         }
-        // inter-warp reductions
-        for (int offset = blockDim.y / 2; offset >= 1; offset /= 2) {
-            // top half write to shared memory
-            if (threadIdx.y >= offset && threadIdx.y < 2 * offset) {
-                const int write_idx = (threadIdx.y - offset) * blockDim.x + threadIdx.x;
-                buf[write_idx] = sum_beta;
-            }
-            __syncthreads();
-            // bottom half sums
-            if (threadIdx.y < offset) {
-                const int read_idx = threadIdx.y * blockDim.x + threadIdx.x;
-                sum_beta += buf[read_idx];
-            }
-            __syncthreads();
+    }
+    // Every thread must execute every barrier, including inactive x lanes in
+    // the final block when col is not a multiple of blockDim.x.
+    for (int offset = blockDim.y / 2; offset >= 1; offset /= 2) {
+        // top half write to shared memory
+        if (column_is_valid && threadIdx.y >= offset && threadIdx.y < 2 * offset) {
+            const int write_idx = (threadIdx.y - offset) * blockDim.x + threadIdx.x;
+            buf[write_idx] = sum_beta;
         }
-        // write out fully summed gradients
-        if (threadIdx.y == 0) {
-            grad_beta[i2] = sum_beta;
+        __syncthreads();
+        // bottom half sums
+        if (column_is_valid && threadIdx.y < offset) {
+            const int read_idx = threadIdx.y * blockDim.x + threadIdx.x;
+            sum_beta += buf[read_idx];
         }
+        __syncthreads();
+    }
+    // write out fully summed gradients
+    if (column_is_valid && threadIdx.y == 0) {
+        grad_beta[i2] = sum_beta;
     }
 }
 
@@ -781,13 +789,13 @@ __global__ void LayerNormInputGradV2(T* __restrict__ grad_output,
 
         #pragma unroll
         for (int i = 0; i < ELEMENTS_PER_THREAD; ++i) {
-            gamma_mul_grad_output +=  gamma_vals[i] * grad_output_vals[i];
+            gamma_mul_grad_output +=  static_cast<float>(gamma_vals[i]) * static_cast<float>(grad_output_vals[i]);
 }
 
         T* input_vals = reinterpret_cast<T*>(&input_vec);
         #pragma unroll
         for (int i = 0; i < ELEMENTS_PER_THREAD; ++i) {
-            gamma_mul_grad_output_input_mean += gamma_vals[i] * grad_output_vals[i] * (input_vals[i] - mean_val);
+            gamma_mul_grad_output_input_mean += static_cast<float>(gamma_vals[i]) * static_cast<float>(grad_output_vals[i]) * (input_vals[i] - mean_val);
         }
     }
     warp_sum_reduce(gamma_mul_grad_output, blockDim.x);
@@ -872,7 +880,7 @@ void HostLayerNormGradient(const V* dout, const float* mean, const float* invvar
 
         at::Tensor part_grad_gamma = at::empty({part_size, col}, input->options().dtype(at::ScalarType::Float));
         at::Tensor part_grad_beta = at::empty_like(part_grad_gamma);
-        LayerNormParamGradStep1<T, V><<<dim3(grid_dim_x, grid_dim_y), dim3(32, 32 / num_per_block)>>>(
+        LayerNormParamGradStep1<T, V><<<dim3(grid_dim_x, grid_dim_y), dim3(32, 32 / num_per_block), 0, stream>>>(
             row, col, dout, input->DATA_PTR<T>(), mean, invvar, part_grad_gamma.DATA_PTR<float>(), part_grad_beta.DATA_PTR<float>()
         );
 
@@ -889,7 +897,7 @@ void HostLayerNormGradient(const V* dout, const float* mean, const float* invvar
         const int grid_dim_y = part_size;
 
         at::Tensor part_grad_gamma = at::empty({part_size, col}, input->options().dtype(at::ScalarType::Float));
-        LayerNormGammaGradStep1<T, V><<<dim3(grid_dim_x, grid_dim_y), dim3(32, 32 / num_per_block)>>>(
+        LayerNormGammaGradStep1<T, V><<<dim3(grid_dim_x, grid_dim_y), dim3(32, 32 / num_per_block), 0, stream>>>(
             row, col, dout, input->DATA_PTR<T>(), mean, invvar, part_grad_gamma.DATA_PTR<float>());
 
         const dim3 threads3(32, 8, 1);
@@ -904,7 +912,7 @@ void HostLayerNormGradient(const V* dout, const float* mean, const float* invvar
         const int grid_dim_y = part_size;
 
         at::Tensor part_grad_beta = at::empty({part_size, col}, input->options().dtype(at::ScalarType::Float));
-        LayerNormBetaGradStep1<T, V><<<dim3(grid_dim_x, grid_dim_y), dim3(32, 32 / num_per_block)>>>(
+        LayerNormBetaGradStep1<T, V><<<dim3(grid_dim_x, grid_dim_y), dim3(32, 32 / num_per_block), 0, stream>>>(
             row, col, dout, input->DATA_PTR<T>(), mean, invvar, part_grad_beta.DATA_PTR<float>()
         );
 
@@ -950,29 +958,29 @@ void HostLayerNormGradient(const V* dout, const float* mean, const float* invvar
     const dim3 block(threads_per_row, rows_per_block);
     if (dtype == torch::kFloat32) {
     if (vec_size == 16)
-        LayerNormInputGradV2<float, float4><<<grid, block>>>((float*)dout, input->DATA_PTR<float>(), row, col, (float*)mean, (float*)invvar, float(epsilon), (float*)gamma, (float*)grad_input);
+        LayerNormInputGradV2<float, float4><<<grid, block, 0, stream>>>((float*)dout, input->DATA_PTR<float>(), row, col, (float*)mean, (float*)invvar, float(epsilon), (float*)gamma, (float*)grad_input);
     else if(vec_size == 8)
-        LayerNormInputGradV2<float, float2><<<grid, block>>>((float*)dout, input->DATA_PTR<float>(), row, col, (float*)mean, (float*)invvar, float(epsilon), (float*)gamma, (float*)grad_input);
+        LayerNormInputGradV2<float, float2><<<grid, block, 0, stream>>>((float*)dout, input->DATA_PTR<float>(), row, col, (float*)mean, (float*)invvar, float(epsilon), (float*)gamma, (float*)grad_input);
     else if(vec_size == 4)
-        LayerNormInputGradV2<float, float><<<grid, block>>>((float*)dout, input->DATA_PTR<float>(), row, col, (float*)mean, (float*)invvar, float(epsilon), (float*)gamma, (float*)grad_input);
+        LayerNormInputGradV2<float, float><<<grid, block, 0, stream>>>((float*)dout, input->DATA_PTR<float>(), row, col, (float*)mean, (float*)invvar, float(epsilon), (float*)gamma, (float*)grad_input);
     } else if (dtype == torch::kFloat16) {
     if (vec_size == 16)
-        LayerNormInputGradV2<at::Half, float4><<<grid, block>>>((at::Half*)dout, input->DATA_PTR<at::Half>(), row, col, (float*)mean, (float*)invvar, float(epsilon), (at::Half*)gamma, (at::Half*)grad_input);
+        LayerNormInputGradV2<at::Half, float4><<<grid, block, 0, stream>>>((at::Half*)dout, input->DATA_PTR<at::Half>(), row, col, (float*)mean, (float*)invvar, float(epsilon), (at::Half*)gamma, (at::Half*)grad_input);
     else if(vec_size == 8)
-        LayerNormInputGradV2<at::Half, float2><<<grid, block>>>((at::Half*)dout, input->DATA_PTR<at::Half>(), row, col, (float*)mean, (float*)invvar, float(epsilon), (at::Half*)gamma, (at::Half*)grad_input);
+        LayerNormInputGradV2<at::Half, float2><<<grid, block, 0, stream>>>((at::Half*)dout, input->DATA_PTR<at::Half>(), row, col, (float*)mean, (float*)invvar, float(epsilon), (at::Half*)gamma, (at::Half*)grad_input);
     else if(vec_size == 4)
-        LayerNormInputGradV2<at::Half, float><<<grid, block>>>((at::Half*)dout, input->DATA_PTR<at::Half>(), row, col, (float*)mean, (float*)invvar, float(epsilon), (at::Half*)gamma, (at::Half*)grad_input);
+        LayerNormInputGradV2<at::Half, float><<<grid, block, 0, stream>>>((at::Half*)dout, input->DATA_PTR<at::Half>(), row, col, (float*)mean, (float*)invvar, float(epsilon), (at::Half*)gamma, (at::Half*)grad_input);
     else if(vec_size == 2)
-        LayerNormInputGradV2<at::Half, at::Half><<<grid, block>>>((at::Half*)dout, input->DATA_PTR<at::Half>(), row, col, (float*)mean, (float*)invvar, float(epsilon), (at::Half*)gamma, (at::Half*)grad_input);
+        LayerNormInputGradV2<at::Half, at::Half><<<grid, block, 0, stream>>>((at::Half*)dout, input->DATA_PTR<at::Half>(), row, col, (float*)mean, (float*)invvar, float(epsilon), (at::Half*)gamma, (at::Half*)grad_input);
     } else {
     if (vec_size == 16)
-        LayerNormInputGradV2<at::BFloat16, float4><<<grid, block>>>((at::BFloat16*)dout, input->DATA_PTR<at::BFloat16>(), row, col, (float*)mean, (float*)invvar, float(epsilon), (at::BFloat16*)gamma, (at::BFloat16*)grad_input);
+        LayerNormInputGradV2<at::BFloat16, float4><<<grid, block, 0, stream>>>((at::BFloat16*)dout, input->DATA_PTR<at::BFloat16>(), row, col, (float*)mean, (float*)invvar, float(epsilon), (at::BFloat16*)gamma, (at::BFloat16*)grad_input);
     else if(vec_size == 8)
-        LayerNormInputGradV2<at::BFloat16, float2><<<grid, block>>>((at::BFloat16*)dout, input->DATA_PTR<at::BFloat16>(), row, col, (float*)mean, (float*)invvar, float(epsilon), (at::BFloat16*)gamma, (at::BFloat16*)grad_input);
+        LayerNormInputGradV2<at::BFloat16, float2><<<grid, block, 0, stream>>>((at::BFloat16*)dout, input->DATA_PTR<at::BFloat16>(), row, col, (float*)mean, (float*)invvar, float(epsilon), (at::BFloat16*)gamma, (at::BFloat16*)grad_input);
     else if(vec_size == 4)
-        LayerNormInputGradV2<at::BFloat16, float><<<grid, block>>>((at::BFloat16*)dout, input->DATA_PTR<at::BFloat16>(), row, col, (float*)mean, (float*)invvar, float(epsilon), (at::BFloat16*)gamma, (at::BFloat16*)grad_input);
+        LayerNormInputGradV2<at::BFloat16, float><<<grid, block, 0, stream>>>((at::BFloat16*)dout, input->DATA_PTR<at::BFloat16>(), row, col, (float*)mean, (float*)invvar, float(epsilon), (at::BFloat16*)gamma, (at::BFloat16*)grad_input);
     else if(vec_size == 2)
-        LayerNormInputGradV2<at::BFloat16, at::BFloat16><<<grid, block>>>((at::BFloat16*)dout, input->DATA_PTR<at::BFloat16>(), row, col, (float*)mean, (float*)invvar, float(epsilon), (at::BFloat16*)gamma, (at::BFloat16*)grad_input);
+        LayerNormInputGradV2<at::BFloat16, at::BFloat16><<<grid, block, 0, stream>>>((at::BFloat16*)dout, input->DATA_PTR<at::BFloat16>(), row, col, (float*)mean, (float*)invvar, float(epsilon), (at::BFloat16*)gamma, (at::BFloat16*)grad_input);
     }
 }
 

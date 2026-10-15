@@ -14,6 +14,7 @@
 
 # pylint: disable=C0114,C0301
 from protenix.config.extend_types import (
+    DefaultNoneWithType,
     GlobalConfigValue,
     ListValue,
     RequiredValue,
@@ -28,7 +29,13 @@ basic_configs = {
     "eval_interval": RequiredValue(int),
     "log_interval": RequiredValue(int),
     "checkpoint_interval": -1,
+    "skip_final_checkpoint": False,
+    "benchmark_warmup_steps": -1,
+    "benchmark_measure_steps": -1,
+    "empty_cache_interval": 0,
     "eval_first": False,  # run evaluate() before training steps
+    "eval_at_end": True,  # run evaluate() after the final training step
+    "eval_worst_sample_count": 20,
     "iters_to_accumulate": 1,
     "finetune_params_with_substring": [
         ""
@@ -49,8 +56,21 @@ basic_configs = {
     "deterministic": False,
     "deterministic_seed": False,
     "ema_decay": -1.0,
+    "ema_shadow_device": "model",
     "eval_ema_only": False,  # whether wandb only tracking ema checkpoint metrics
     "ema_mutable_param_keywords": [""],
+    "distributed_strategy": "ddp",
+    "ddp": {
+        # Reuse DDP communication-bucket storage as parameter-gradient storage.
+        # This is opt-in because it changes the lifetime/layout of ``.grad``.
+        "gradient_as_bucket_view": False,
+    },
+    "fsdp": {
+        "mesh": "auto",
+        "param_dtype": "fp32",
+        "reduce_dtype": "fp32",
+        "reshard_after_forward": True,
+    },
     "model_name": "protenix_base_default_v1.0.0",  # train model name
 }
 data_configs = {
@@ -78,6 +98,7 @@ optim_configs = {
     "min_lr_ratio": 0.1,
     "decay_every_n_steps": 50000,
     "grad_clip_norm": 10,
+    "optimizer_sharding": "none",
     # Optim - Adam
     "adam": {
         "beta1": 0.9,
@@ -85,6 +106,9 @@ optim_configs = {
         "weight_decay": 1e-8,
         "lr": GlobalConfigValue("lr"),
         "use_adamw": False,
+        # This switch applies only to the existing torch.optim.Adam path.
+        # It deliberately does not select AdamW or alter weight-decay semantics.
+        "fused": False,
     },
     # Optim - LRScheduler
     "af3_lr_scheduler": {
@@ -275,6 +299,7 @@ model_configs = {
             "msa_dropout": 0.15,
             "pair_dropout": 0.25,
             "blocks_per_ckpt": GlobalConfigValue("blocks_per_ckpt"),
+            "checkpoint_cpu_offload_every_n": DefaultNoneWithType(int),
             "hidden_scale_up": GlobalConfigValue("hidden_scale_up"),
             "msa_chunk_size": ValueMaybeNone(2048),
             "msa_max_size": 16384,
@@ -313,7 +338,10 @@ model_configs = {
             "n_heads": 16,
             "dropout": 0.25,
             "blocks_per_ckpt": GlobalConfigValue("blocks_per_ckpt"),
+            "checkpoint_cpu_offload_every_n": DefaultNoneWithType(int),
             "hidden_scale_up": GlobalConfigValue("hidden_scale_up"),
+            "train_pair_transition_chunk_size": DefaultNoneWithType(int),
+            "train_pair_transition_checkpoint_chunks": False,
         },
         "diffusion_module": {
             "use_fine_grained_checkpoint": True,
@@ -337,6 +365,8 @@ model_configs = {
                 "n_heads": 4,
             },
             "blocks_per_ckpt": GlobalConfigValue("blocks_per_ckpt"),
+            "train_pair_transition_chunk_size": DefaultNoneWithType(int),
+            "train_pair_transition_checkpoint_chunks": False,
         },
         "confidence_head": {
             "c_z": GlobalConfigValue("c_z"),

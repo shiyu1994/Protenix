@@ -19,6 +19,89 @@ import torch
 from protenix.utils.permutation import atom_permutation, chain_permutation
 
 
+def _diffusion_supervision_minimum(input_feature_dict: dict) -> int:
+    """Read the per-sample minimum carried through the model input."""
+    value = input_feature_dict.get("min_diffusion_supervised_tokens", 0)
+    if isinstance(value, torch.Tensor):
+        if value.numel() != 1:
+            raise ValueError(
+                "min_diffusion_supervised_tokens must contain one value, got "
+                f"shape {tuple(value.shape)}"
+            )
+        value = value.item()
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(
+            "min_diffusion_supervised_tokens must be a non-negative integer, "
+            f"got {type(value).__name__}: {value!r}"
+        )
+    if value < 0:
+        raise ValueError(
+            "min_diffusion_supervised_tokens must be >= 0, "
+            f"got {value}"
+        )
+    return value
+
+
+def _count_diffusion_supervised_tokens_after_permutation(
+    input_feature_dict: dict,
+    label_dict: dict,
+) -> int:
+    """Count effective label-bearing tokens after label permutations."""
+    coordinate_mask = label_dict["coordinate_mask"].bool().flatten()
+    atom_to_token_idx = input_feature_dict["atom_to_token_idx"].long().flatten()
+    if coordinate_mask.shape != atom_to_token_idx.shape:
+        raise ValueError(
+            "permuted coordinate_mask and atom_to_token_idx must have the "
+            f"same shape: {tuple(coordinate_mask.shape)} versus "
+            f"{tuple(atom_to_token_idx.shape)}"
+        )
+
+    protein_only = input_feature_dict.get(
+        "disable_non_protein_diffusion_weights",
+        False,
+    )
+    if isinstance(protein_only, torch.Tensor):
+        if protein_only.numel() != 1:
+            raise ValueError(
+                "disable_non_protein_diffusion_weights must contain one "
+                f"value, got shape {tuple(protein_only.shape)}"
+            )
+        protein_only = bool(protein_only.item())
+    elif not isinstance(protein_only, bool):
+        raise TypeError(
+            "disable_non_protein_diffusion_weights must be a boolean, got "
+            f"{type(protein_only).__name__}: {protein_only!r}"
+        )
+
+    if protein_only:
+        is_protein = input_feature_dict["is_protein"].bool().flatten()
+        if is_protein.shape != coordinate_mask.shape:
+            raise ValueError(
+                "is_protein and permuted coordinate_mask must have the same "
+                f"shape: {tuple(is_protein.shape)} versus "
+                f"{tuple(coordinate_mask.shape)}"
+            )
+        coordinate_mask = torch.logical_and(coordinate_mask, is_protein)
+
+    if not coordinate_mask.any():
+        return 0
+    return int(
+        torch.unique(atom_to_token_idx[coordinate_mask]).numel()
+    )
+
+
+def _permutation_preserves_diffusion_minimum(
+    input_feature_dict: dict,
+    label_dict: dict,
+    minimum: int,
+) -> tuple[bool, int]:
+    count = _count_diffusion_supervised_tokens_after_permutation(
+        input_feature_dict=input_feature_dict,
+        label_dict=label_dict,
+    )
+    return count >= minimum, count
+
+
 class SymmetricPermutation(object):
     """
     A symmetric permutation class for chain and atom permutations.
@@ -58,6 +141,21 @@ class SymmetricPermutation(object):
         assert mini_coord.dim() == 3
 
         log_dict = {}
+        minimum = _diffusion_supervision_minimum(input_feature_dict)
+        if minimum > 0:
+            original_ok, original_count = (
+                _permutation_preserves_diffusion_minimum(
+                    input_feature_dict=input_feature_dict,
+                    label_dict=label_dict,
+                    minimum=minimum,
+                )
+            )
+            if not original_ok:
+                raise RuntimeError(
+                    "label has too few diffusion-supervised tokens before "
+                    f"mini-rollout permutation: {original_count} < {minimum}"
+                )
+
         # 1. ChainPermutation: permute ground-truth chains to match mini-rollout prediction
         permuted_label_dict, chain_perm_log_dict, _, _ = chain_permutation.run(
             mini_coord[0],  # Only accepts a single structure
@@ -68,7 +166,26 @@ class SymmetricPermutation(object):
             **self.configs.chain_permutation.configs,
         )
         if self.configs.chain_permutation.train.mini_rollout:
-            label_dict.update(permuted_label_dict)
+            chain_candidate = {**label_dict, **permuted_label_dict}
+            chain_candidate_ok = True
+            chain_candidate_count = None
+            if minimum > 0:
+                chain_candidate_ok, chain_candidate_count = (
+                    _permutation_preserves_diffusion_minimum(
+                        input_feature_dict=input_feature_dict,
+                        label_dict=chain_candidate,
+                        minimum=minimum,
+                    )
+                )
+            if chain_candidate_ok:
+                label_dict.update(permuted_label_dict)
+            else:
+                log_dict[
+                    "minirollout_perm/Chain-min_supervision_rejected"
+                ] = 1.0
+                log_dict[
+                    "minirollout_perm/Chain-rejected_supervised_tokens"
+                ] = float(chain_candidate_count)
             log_dict.update(
                 {
                     f"minirollout_perm/Chain-{k}": v
@@ -97,7 +214,26 @@ class SymmetricPermutation(object):
         )
 
         if self.configs.atom_permutation.train.mini_rollout:
-            label_dict.update(permuted_label_dict)
+            atom_candidate = {**label_dict, **permuted_label_dict}
+            atom_candidate_ok = True
+            atom_candidate_count = None
+            if minimum > 0:
+                atom_candidate_ok, atom_candidate_count = (
+                    _permutation_preserves_diffusion_minimum(
+                        input_feature_dict=input_feature_dict,
+                        label_dict=atom_candidate,
+                        minimum=minimum,
+                    )
+                )
+            if atom_candidate_ok:
+                label_dict.update(permuted_label_dict)
+            else:
+                log_dict[
+                    "minirollout_perm/Atom-min_supervision_rejected"
+                ] = 1.0
+                log_dict[
+                    "minirollout_perm/Atom-rejected_supervised_tokens"
+                ] = float(atom_candidate_count)
             log_dict.update(
                 {f"minirollout_perm/Atom-{k}": v for k, v in atom_perm_log_dict.items()}
             )
@@ -109,6 +245,21 @@ class SymmetricPermutation(object):
                     for k, v in atom_perm_log_dict.items()
                 }
             )
+
+        if minimum > 0:
+            final_ok, final_count = _permutation_preserves_diffusion_minimum(
+                input_feature_dict=input_feature_dict,
+                label_dict=label_dict,
+                minimum=minimum,
+            )
+            if not final_ok:
+                raise RuntimeError(
+                    "label has too few diffusion-supervised tokens after "
+                    f"mini-rollout permutation: {final_count} < {minimum}"
+                )
+            log_dict[
+                "minirollout_perm/N_diffusion_supervised_token"
+            ] = float(final_count)
 
         return label_dict, log_dict
 

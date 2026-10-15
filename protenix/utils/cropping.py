@@ -425,6 +425,12 @@ class CropData(object):
         spatial_crop_complete_lig (bool, optional): Whether to crop the complete ligand in SpatialCropping method. Defaults to False.
         drop_last (bool, optional): whether to ensure all ligands or unstandard residues to be cropped completely. Defaults to False.
         remove_metal (bool, optional): whether remove all metal/ions. Defaults to False.
+        max_nuc_tokens (int, optional): Maximum selected nucleic-acid tokens.
+        required_token_mask (torch.Tensor, optional): Token-level eligibility
+            mask. Every returned crop must contain ``min_required_tokens``
+            eligible tokens.
+        min_required_tokens (int, optional): Minimum number of eligible tokens
+            required in every crop.
     """
 
     def __init__(
@@ -438,6 +444,9 @@ class CropData(object):
         spatial_crop_complete_lig: bool = False,
         drop_last: bool = False,
         remove_metal: bool = False,
+        max_nuc_tokens: int = -1,
+        required_token_mask: Optional[torch.Tensor] = None,
+        min_required_tokens: int = 1,
     ) -> None:
         self.crop_size = crop_size
         self.ref_chain_indices = ref_chain_indices
@@ -453,6 +462,394 @@ class CropData(object):
         self.spatial_crop_complete_lig = spatial_crop_complete_lig
         self.drop_last = drop_last
         self.remove_metal = remove_metal
+        self.max_nuc_tokens = max_nuc_tokens
+        if isinstance(min_required_tokens, bool) or not isinstance(
+            min_required_tokens, int
+        ):
+            raise TypeError(
+                "min_required_tokens must be a positive integer, got "
+                f"{type(min_required_tokens).__name__}: "
+                f"{min_required_tokens!r}"
+            )
+        if min_required_tokens < 1:
+            raise ValueError(
+                "min_required_tokens must be >= 1, got "
+                f"{min_required_tokens}"
+            )
+        if crop_size > 0 and min_required_tokens > crop_size:
+            raise ValueError(
+                "min_required_tokens cannot exceed crop_size: "
+                f"{min_required_tokens} > {crop_size}"
+            )
+        self.min_required_tokens = min_required_tokens
+        self.required_token_mask = (
+            None
+            if required_token_mask is None
+            else torch.as_tensor(required_token_mask, dtype=torch.bool).flatten()
+        )
+        if self.required_token_mask is not None:
+            if self.required_token_mask.shape != (len(self.token_array),):
+                raise ValueError(
+                    "required_token_mask must have one value per token: "
+                    f"{self.required_token_mask.shape=} versus "
+                    f"{len(self.token_array)=}"
+                )
+            eligible_count = int(self.required_token_mask.sum())
+            if eligible_count < self.min_required_tokens:
+                raise ValueError(
+                    "required_token_mask contains too few eligible tokens: "
+                    f"{eligible_count} < {self.min_required_tokens}"
+                )
+
+    def _get_nuc_mask(self) -> np.ndarray:
+        centre_atom_indices = self.token_array.get_annotation("centre_atom_index")
+        centre_atoms = self.atom_array[centre_atom_indices]
+        return np.logical_or(centre_atoms.is_dna, centre_atoms.is_rna)
+
+    def _limit_nuc_tokens(
+        self,
+        selected_token_indices: torch.Tensor,
+        reference_token_index: Optional[int] = None,
+    ) -> torch.Tensor:
+        if self.max_nuc_tokens <= 0:
+            return selected_token_indices
+
+        nuc_mask = self._get_nuc_mask()
+        selected_nuc = nuc_mask[selected_token_indices.numpy()]
+        nuc_positions = np.where(selected_nuc)[0]
+
+        if len(nuc_positions) <= self.max_nuc_tokens:
+            return selected_token_indices
+
+        if reference_token_index is not None:
+            ref_centre_idx = int(
+                self.token_array.get_annotation("centre_atom_index")[reference_token_index]
+            )
+            ref_coord = self.atom_array.coord[ref_centre_idx]
+            nuc_abs = selected_token_indices[nuc_positions].numpy()
+            nuc_centre = np.array(
+                self.token_array.get_annotation("centre_atom_index")
+            )[nuc_abs]
+            nuc_coords = self.atom_array.coord[nuc_centre]
+            dists = np.linalg.norm(nuc_coords - ref_coord, axis=1)
+            keep_order = np.argsort(dists)[: self.max_nuc_tokens]
+            keep_nuc_positions = nuc_positions[keep_order]
+        else:
+            keep_nuc_positions = nuc_positions[: self.max_nuc_tokens]
+
+        keep_mask = np.ones(len(selected_token_indices), dtype=bool)
+        keep_mask[nuc_positions] = False
+        keep_mask[keep_nuc_positions] = True
+
+        return selected_token_indices[torch.tensor(keep_mask)].sort().values
+
+    def _ensure_required_tokens(
+        self,
+        selected_token_indices: torch.Tensor,
+        reference_token_index: Optional[int] = None,
+    ) -> torch.Tensor:
+        """Enforce the token-level supervision minimum before MSA I/O.
+
+        The original crop remains the geometric anchor. Missing eligible
+        tokens are chosen by distance to that anchor. If space is needed,
+        complete ``ref_space_uid`` groups containing no already-selected
+        eligible token are removed first, preserving both supervision and
+        complete multi-token molecules whenever possible.
+        """
+        if self.required_token_mask is None:
+            return selected_token_indices
+
+        selected_token_indices = torch.unique(
+            torch.as_tensor(
+                selected_token_indices,
+                dtype=torch.long,
+            ).flatten(),
+            sorted=True,
+        )
+        if selected_token_indices.numel() > self.crop_size:
+            raise RuntimeError(
+                "input crop exceeds crop_size before enforcing required tokens"
+            )
+        selected_required_count = int(
+            self.required_token_mask[selected_token_indices].sum()
+        )
+        if selected_required_count >= self.min_required_tokens:
+            return selected_token_indices
+
+        centre_atom_indices = np.asarray(
+            self.token_array.get_annotation("centre_atom_index")
+        )
+        centre_coordinates = np.asarray(
+            self.atom_array.coord[centre_atom_indices],
+            dtype=np.float64,
+        )
+        required_indices = torch.nonzero(
+            self.required_token_mask,
+            as_tuple=True,
+        )[0]
+        required_coordinates = centre_coordinates[
+            required_indices.numpy()
+        ].copy()
+
+        # A token may have a missing centre atom while another supervised atom
+        # in the token is finite. Use the latter only as its distance proxy.
+        for required_position, required_index in enumerate(
+            required_indices.tolist()
+        ):
+            atom_indices = np.asarray(
+                self.token_array[required_index].atom_indices,
+                dtype=np.int64,
+            )
+            centre_atom_index = int(centre_atom_indices[required_index])
+            atom_indices = np.concatenate(
+                (
+                    np.asarray([centre_atom_index], dtype=np.int64),
+                    atom_indices[atom_indices != centre_atom_index],
+                )
+            )
+            atom_coordinates = np.asarray(
+                self.atom_array.coord[atom_indices],
+                dtype=np.float64,
+            )
+            preferred_atom_mask = np.isfinite(atom_coordinates).all(axis=-1)
+            if hasattr(self.atom_array, "is_resolved"):
+                preferred_atom_mask &= np.asarray(
+                    self.atom_array.is_resolved[atom_indices],
+                    dtype=bool,
+                )
+            if hasattr(self.atom_array, "is_protein"):
+                token_protein_mask = np.asarray(
+                    self.atom_array.is_protein[atom_indices],
+                    dtype=bool,
+                )
+                if token_protein_mask.any():
+                    preferred_atom_mask &= token_protein_mask
+            preferred_atom_coordinates = atom_coordinates[
+                preferred_atom_mask
+            ]
+            if preferred_atom_coordinates.shape[0] > 0:
+                required_coordinates[required_position] = (
+                    preferred_atom_coordinates[0]
+                )
+            elif not np.isfinite(
+                required_coordinates[required_position]
+            ).all():
+                finite_atom_coordinates = atom_coordinates[
+                    np.isfinite(atom_coordinates).all(axis=-1)
+                ]
+                if finite_atom_coordinates.shape[0] > 0:
+                    required_coordinates[required_position] = (
+                        finite_atom_coordinates[0]
+                    )
+
+        if reference_token_index is not None and 0 <= int(
+            reference_token_index
+        ) < len(self.token_array):
+            anchor_indices = np.asarray(
+                [int(reference_token_index)],
+                dtype=np.int64,
+            )
+        else:
+            anchor_indices = selected_token_indices.numpy()
+        anchor_coordinates = centre_coordinates[anchor_indices]
+        anchor_coordinates = anchor_coordinates[
+            np.isfinite(anchor_coordinates).all(axis=-1)
+        ]
+        if (
+            anchor_coordinates.shape[0] == 0
+            and selected_token_indices.numel() > 0
+        ):
+            selected_coordinates = centre_coordinates[
+                selected_token_indices.numpy()
+            ]
+            anchor_coordinates = selected_coordinates[
+                np.isfinite(selected_coordinates).all(axis=-1)
+            ]
+
+        finite_required_mask = np.isfinite(required_coordinates).all(axis=-1)
+        required_distance = np.full(
+            len(required_indices),
+            np.inf,
+            dtype=np.float64,
+        )
+        if (
+            anchor_coordinates.shape[0] > 0
+            and finite_required_mask.any()
+        ):
+            required_distance[finite_required_mask] = cdist(
+                required_coordinates[finite_required_mask],
+                anchor_coordinates,
+            ).min(axis=-1)
+        required_index_array = required_indices.numpy()
+        required_order = np.lexsort(
+            (required_index_array, required_distance)
+        )
+        selected_set = set(selected_token_indices.tolist())
+        ordered_candidates = [
+            int(required_index_array[position])
+            for position in required_order
+            if int(required_index_array[position]) not in selected_set
+        ]
+        missing_count = (
+            self.min_required_tokens - selected_required_count
+        )
+        if len(ordered_candidates) < missing_count:
+            raise RuntimeError(
+                "not enough unselected eligible tokens to satisfy crop "
+                f"minimum {self.min_required_tokens}"
+            )
+        insertion_indices = ordered_candidates[:missing_count]
+        required_position_by_index = {
+            int(required_index): position
+            for position, required_index in enumerate(required_index_array)
+        }
+        insertion_coordinates = required_coordinates[
+            [
+                required_position_by_index[index]
+                for index in insertion_indices
+            ]
+        ]
+        insertion_coordinates = insertion_coordinates[
+            np.isfinite(insertion_coordinates).all(axis=-1)
+        ]
+        distance_targets = (
+            insertion_coordinates
+            if insertion_coordinates.shape[0] > 0
+            else anchor_coordinates
+        )
+
+        slots_needed = max(
+            0,
+            selected_token_indices.numel()
+            + missing_count
+            - self.crop_size,
+        )
+        if slots_needed > 0:
+            token_ref_space_uid = np.asarray(
+                self.atom_array.ref_space_uid[centre_atom_indices]
+            )
+            selected_numpy = selected_token_indices.numpy()
+            selected_uids = token_ref_space_uid[selected_numpy]
+            selected_required = self.required_token_mask[
+                selected_token_indices
+            ].numpy()
+            protected_required_uids = set(
+                selected_uids[selected_required].tolist()
+            )
+            protected_reference_uid = None
+            if (
+                reference_token_index is not None
+                and int(reference_token_index) in selected_set
+            ):
+                protected_reference_uid = token_ref_space_uid[
+                    int(reference_token_index)
+                ]
+
+            def uid_distance(uid: Any) -> float:
+                uid_token_indices = selected_numpy[selected_uids == uid]
+                uid_coordinates = centre_coordinates[uid_token_indices]
+                uid_coordinates = uid_coordinates[
+                    np.isfinite(uid_coordinates).all(axis=-1)
+                ]
+                if (
+                    uid_coordinates.shape[0] == 0
+                    or distance_targets.shape[0] == 0
+                ):
+                    return float("inf")
+                return float(
+                    cdist(uid_coordinates, distance_targets)
+                    .min(axis=-1)
+                    .max()
+                )
+
+            candidate_uids = [
+                uid
+                for uid in np.unique(selected_uids)
+                if uid not in protected_required_uids
+            ]
+            unprotected_uids = [
+                uid
+                for uid in candidate_uids
+                if uid != protected_reference_uid
+            ]
+            protected_reference_candidates = [
+                uid
+                for uid in candidate_uids
+                if uid == protected_reference_uid
+            ]
+            removable_uids = sorted(
+                unprotected_uids,
+                key=lambda uid: (uid_distance(uid), str(uid)),
+                reverse=True,
+            ) + protected_reference_candidates
+
+            keep_mask = np.ones(
+                selected_token_indices.numel(),
+                dtype=bool,
+            )
+            removed_count = 0
+            for uid in removable_uids:
+                uid_positions = selected_uids == uid
+                keep_mask[uid_positions] = False
+                removed_count += int(uid_positions.sum())
+                if removed_count >= slots_needed:
+                    break
+
+            if removed_count < slots_needed:
+                # Pathological mixed-UID data may place supervised and
+                # unsupervised atom tokens in one ref_space_uid. The hard
+                # supervision minimum takes precedence; remove only
+                # unsupervised tokens as a last resort.
+                remaining_positions = np.flatnonzero(
+                    np.logical_and(keep_mask, ~selected_required)
+                )
+                for position in remaining_positions[::-1]:
+                    keep_mask[position] = False
+                    removed_count += 1
+                    if removed_count >= slots_needed:
+                        break
+            if removed_count < slots_needed:
+                raise RuntimeError(
+                    "failed to make room for required tokens without "
+                    "removing already-supervised tokens"
+                )
+            selected_token_indices = selected_token_indices[
+                torch.from_numpy(keep_mask)
+            ]
+
+        selected_token_indices = torch.unique(
+            torch.cat(
+                (
+                    selected_token_indices,
+                    torch.tensor(insertion_indices, dtype=torch.long),
+                )
+            ),
+            sorted=True,
+        )
+        if selected_token_indices.numel() > self.crop_size:
+            raise RuntimeError(
+                "failed to enforce required_token_mask within crop size"
+            )
+        selected_required_count = int(
+            self.required_token_mask[selected_token_indices].sum()
+        )
+        if selected_required_count < self.min_required_tokens:
+            raise RuntimeError(
+                "failed to insert enough required tokens into crop: "
+                f"{selected_required_count} < {self.min_required_tokens}"
+            )
+        return selected_token_indices
+
+    def _ensure_required_token(
+        self,
+        selected_token_indices: torch.Tensor,
+        reference_token_index: Optional[int] = None,
+    ) -> torch.Tensor:
+        """Backward-compatible alias for the plural minimum-enforcing path."""
+        return self._ensure_required_tokens(
+            selected_token_indices=selected_token_indices,
+            reference_token_index=reference_token_index,
+        )
 
     def random_crop_method(self) -> str:
         """
@@ -631,7 +1028,17 @@ class CropData(object):
                 drop_last=self.drop_last,
                 remove_metal=self.remove_metal,
             )
-            reference_token_index = -1
+            selected_token_indices = self._limit_nuc_tokens(
+                selected_token_indices, reference_token_index=None
+            )
+            selected_token_indices = self._ensure_required_tokens(
+                selected_token_indices,
+                reference_token_index=None,
+            )
+            return (
+                selected_token_indices,
+                token_indices_in_ref[-1].item(),
+            )
 
         else:
             interface_crop = (
@@ -644,7 +1051,7 @@ class CropData(object):
                 token_dist_mask_1d[token_indices_in_ref][:, None]
                 * token_dist_mask_1d[None, :]
             )
-            selected_token_indices, reference_token_index = get_spatial_crop_index(
+            selected_token_indices, ref_idx_in_ref = get_spatial_crop_index(
                 tokens=tokens,
                 chain_id=chain_id,
                 token_distance=torch.Tensor(token_distance),
@@ -655,7 +1062,15 @@ class CropData(object):
                 crop_complete_ligand_unstdRes=self.spatial_crop_complete_lig,
                 interface_crop=interface_crop,
             )
-        return (
-            selected_token_indices,
-            token_indices_in_ref[reference_token_index].item(),
-        )
+            abs_ref_idx = token_indices_in_ref[ref_idx_in_ref].item()
+            selected_token_indices = self._limit_nuc_tokens(
+                selected_token_indices, reference_token_index=abs_ref_idx
+            )
+            selected_token_indices = self._ensure_required_tokens(
+                selected_token_indices,
+                reference_token_index=abs_ref_idx,
+            )
+            return (
+                selected_token_indices,
+                abs_ref_idx,
+            )

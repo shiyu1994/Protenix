@@ -232,7 +232,11 @@ def parse_configs(
     ) in manager.config_infos.items():
         # All config use str type, strings will be converted to real dtype later
         parser.add_argument(
-            "--" + key, type=str, default=ArgumentNotSet(), required=required
+            "--" + key,
+            dest=key,
+            type=str,
+            default=ArgumentNotSet(),
+            required=required,
         )
     # Merge user commandline pargs with default ones
     merged_configs = manager.merge_configs(

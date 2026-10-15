@@ -54,6 +54,32 @@ class TestSchedule(unittest.TestCase):
         self.assertEqual(learning_rates[1000], 1.8e-3)
         self.assertEqual(learning_rates[50000], 0.95 * 1.8e-3)
 
+    def test_crop384_v8_af3_lr_schedule_boundaries(self):
+        model = SimpleModel()
+        optimizer = torch.optim.Adam(
+            model.parameters(),
+            lr=1e-3,
+            betas=(0.9, 0.95),
+            eps=1e-8,
+        )
+        scheduler = AlphaFold3LRScheduler(
+            optimizer=optimizer,
+            warmup_steps=1000,
+            lr=1e-3,
+            decay_every_n_steps=25000,
+            decay_factor=0.95,
+        )
+
+        self.assertEqual(scheduler._get_step_lr(0), 0)
+        self.assertEqual(scheduler._get_step_lr(1000), 1e-3)
+        self.assertEqual(scheduler._get_step_lr(24999), 1e-3)
+        self.assertEqual(scheduler._get_step_lr(25000), 0.95e-3)
+        self.assertEqual(scheduler._get_step_lr(49999), 0.95e-3)
+        self.assertEqual(
+            scheduler._get_step_lr(50000),
+            (0.95**2) * 1e-3,
+        )
+
     def tearDown(self):
         elapsed_time = time.time() - self._start_time
         print(f"Test {self.id()} took {elapsed_time:.6f}s")

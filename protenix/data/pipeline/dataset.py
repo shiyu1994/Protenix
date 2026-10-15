@@ -15,9 +15,11 @@
 import json
 import os
 import random
+import time
 import traceback
+from bisect import bisect_right
 from copy import deepcopy
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Optional, Union
 
 import numpy as np
@@ -30,9 +32,36 @@ from torch.utils.data import Dataset
 from protenix.data.constants import EvaluationChainInterface
 from protenix.data.constraint.constraint_featurizer import ConstraintFeatureGenerator
 from protenix.data.core.featurizer import Featurizer
-from protenix.data.msa.msa_featurizer import MSAFeaturizer
+from protenix.data.msa.msa_featurizer import (
+    DIRECT_PROTEIN_UNPAIRED_MSA_PATH,
+    MSAFeaturizer,
+)
 from protenix.data.pipeline.data_pipeline import DataPipeline
-from protenix.data.template.template_featurizer import TemplateFeaturizer
+from protenix.data.pipeline.distillation_runtime_index import (
+    DistillationRuntimeIndex,
+    structure_basename,
+)
+from protenix.data.pipeline.sample_context import (
+    AUGMENTATION_DECISION_VERSION,
+    MSA_MODE_CONFIGURED,
+    MSA_MODE_QUERY_ONLY,
+    MSA_MODE_SPECIES_PAIRED,
+    MSA_MODE_UNPAIRED_SHUFFLE,
+    MULTICHAIN_MSA_SHUFFLE_VARIANT_STREAM,
+    QUERY_ONLY_CHAIN_SELECTION_STREAM,
+    SampleOccurrence,
+    VIRTUAL_SEGMENT_MSA_SHUFFLE_STREAM,
+    deterministic_occurrence_bernoulli,
+    deterministic_occurrence_categorical,
+    deterministic_occurrence_seed,
+    split_sample_index,
+)
+from protenix.data.template.template_featurizer import (
+    DummyTemplateFeaturizer,
+    SEQUENCE_TEMPLATE_CACHE_ERROR_REASONS,
+    SequenceTemplateCacheError,
+    TemplateFeaturizer,
+)
 from protenix.data.tokenizer import TokenArray
 from protenix.data.utils import (
     data_type_transform,
@@ -45,6 +74,112 @@ from protenix.utils.logger import get_logger
 from protenix.utils.torch_utils import dict_to_tensor
 
 logger = get_logger(__name__)
+
+
+def _strict_bool_option(
+    options: dict[str, Any],
+    name: str,
+    default: bool = False,
+) -> bool:
+    """Read a boolean dataset option without accepting truthy strings."""
+    value = options.get(name, default)
+    if not isinstance(value, (bool, np.bool_)):
+        raise TypeError(
+            f"{name} must be a boolean, got {type(value).__name__}: {value!r}"
+        )
+    return bool(value)
+
+
+def _strict_nonnegative_int_option(
+    options: dict[str, Any],
+    name: str,
+    default: int = 0,
+) -> int:
+    """Read a non-negative integer option without accepting bools/floats."""
+    value = options.get(name, default)
+    if isinstance(value, (bool, np.bool_)) or not isinstance(
+        value, (int, np.integer)
+    ):
+        raise TypeError(
+            f"{name} must be a non-negative integer, got "
+            f"{type(value).__name__}: {value!r}"
+        )
+    value = int(value)
+    if value < 0:
+        raise ValueError(f"{name} must be >= 0, got {value}")
+    return value
+
+
+def _diffusion_supervised_token_mask(
+    token_array: TokenArray,
+    atom_array: AtomArray,
+    *,
+    protein_only: bool,
+) -> torch.Tensor:
+    """Return tokens containing an atom used by diffusion coordinate losses."""
+    eligible_atoms = np.asarray(atom_array.is_resolved, dtype=bool)
+    if protein_only:
+        eligible_atoms = np.logical_and(
+            eligible_atoms,
+            np.asarray(atom_array.is_protein, dtype=bool),
+        )
+    eligible_tokens = np.fromiter(
+        (
+            bool(
+                eligible_atoms[
+                    np.asarray(token.atom_indices, dtype=np.int64)
+                ].any()
+            )
+            for token in token_array
+        ),
+        dtype=bool,
+        count=len(token_array),
+    )
+    return torch.from_numpy(eligible_tokens)
+
+
+def _resolved_protein_token_mask(
+    token_array: TokenArray,
+    atom_array: AtomArray,
+) -> torch.Tensor:
+    """Return tokens containing at least one resolved protein atom."""
+    return _diffusion_supervised_token_mask(
+        token_array=token_array,
+        atom_array=atom_array,
+        protein_only=True,
+    )
+
+
+def _count_diffusion_supervised_feature_tokens(
+    features: dict[str, torch.Tensor],
+    labels: dict[str, torch.Tensor],
+    *,
+    protein_only: bool,
+) -> int:
+    """Count final model-input tokens carrying diffusion coordinate labels."""
+    coordinate_mask = labels["coordinate_mask"].bool().flatten()
+    atom_to_token_idx = features["atom_to_token_idx"].long().flatten()
+    if coordinate_mask.shape != atom_to_token_idx.shape:
+        raise ValueError(
+            "coordinate_mask and atom_to_token_idx must have the same shape: "
+            f"{tuple(coordinate_mask.shape)} versus "
+            f"{tuple(atom_to_token_idx.shape)}"
+        )
+    if protein_only:
+        is_protein = features["is_protein"].bool().flatten()
+        if is_protein.shape != coordinate_mask.shape:
+            raise ValueError(
+                "is_protein and coordinate_mask must have the same shape: "
+                f"{tuple(is_protein.shape)} versus "
+                f"{tuple(coordinate_mask.shape)}"
+            )
+        coordinate_mask = torch.logical_and(
+            coordinate_mask,
+            is_protein,
+        )
+    if not coordinate_mask.any():
+        return 0
+    return int(torch.unique(atom_to_token_idx[coordinate_mask]).numel())
 
 
 class BaseSingleDataset(Dataset):
@@ -63,6 +198,8 @@ class BaseSingleDataset(Dataset):
         msa_featurizer: Optional[MSAFeaturizer] = None,
         template_featurizer: Optional[TemplateFeaturizer] = None,
         name: str = None,
+        source_roots_fpath: Optional[Union[str, Path]] = None,
+        runtime_index_dir: Optional[Union[str, Path]] = None,
         **kwargs,
     ) -> None:
         super(BaseSingleDataset, self).__init__()
@@ -70,7 +207,39 @@ class BaseSingleDataset(Dataset):
         # Configs
         self.mmcif_dir = mmcif_dir
         self.bioassembly_dict_dir = bioassembly_dict_dir
+        self.bioassembly_relpath_column = kwargs.get(
+            "bioassembly_relpath_column"
+        )
+        if (
+            self.bioassembly_relpath_column is not None
+            and self.bioassembly_dict_dir is None
+        ):
+            raise ValueError(
+                "bioassembly_relpath_column requires bioassembly_dict_dir"
+            )
         self.indices_fpath = indices_fpath
+        self.runtime_distillation_index = (
+            DistillationRuntimeIndex(runtime_index_dir)
+            if runtime_index_dir is not None
+            else None
+        )
+        if self.runtime_distillation_index is not None:
+            runtime_roots_path = self.runtime_distillation_index.roots_path
+            if source_roots_fpath is not None:
+                configured_roots_path = (
+                    Path(source_roots_fpath).expanduser().resolve(strict=True)
+                )
+                if configured_roots_path != runtime_roots_path:
+                    raise ValueError(
+                        "runtime_index_dir cannot be combined with a different "
+                        "source_roots_fpath: "
+                        f"{configured_roots_path} != {runtime_roots_path}"
+                    )
+            self.source_roots_fpath = runtime_roots_path
+            self.source_roots = self.runtime_distillation_index.source_roots
+        else:
+            self.source_roots_fpath = source_roots_fpath
+            self.source_roots = self._load_source_roots(source_roots_fpath)
         self.cropping_configs = cropping_configs
         self.name = name
         # General dataset configs
@@ -93,15 +262,85 @@ class BaseSingleDataset(Dataset):
         self.random_sample_if_failed = kwargs.get("random_sample_if_failed", False)
         self.use_reference_chains_only = kwargs.get("use_reference_chains_only", False)
         self.is_distillation = kwargs.get("is_distillation", False)
+        self.disable_non_protein_diffusion_weights = _strict_bool_option(
+            kwargs,
+            "disable_non_protein_diffusion_weights",
+        )
+        self.require_resolved_protein_crop = _strict_bool_option(
+            kwargs,
+            "require_resolved_protein_crop",
+        )
+        self.min_diffusion_supervised_tokens = (
+            _strict_nonnegative_int_option(
+                kwargs,
+                "min_diffusion_supervised_tokens",
+            )
+        )
+        configured_crop_size = int(
+            self.cropping_configs.get("crop_size", -1)
+        )
+        if (
+            configured_crop_size > 0
+            and self.min_diffusion_supervised_tokens
+            > configured_crop_size
+        ):
+            raise ValueError(
+                "min_diffusion_supervised_tokens cannot exceed crop_size: "
+                f"{self.min_diffusion_supervised_tokens} > "
+                f"{configured_crop_size}"
+            )
+        if self.disable_non_protein_diffusion_weights and not self.is_distillation:
+            raise ValueError(
+                "disable_non_protein_diffusion_weights requires "
+                "is_distillation=True"
+            )
+        self.query_only_msa_probability = float(
+            kwargs.get("query_only_msa_probability", 0.0)
+        )
+        self.pair_msa_as_unpaired_probability = float(
+            kwargs.get("pair_msa_as_unpaired_probability", 0.0)
+        )
+        self.template_use_probability = float(
+            kwargs.get("template_use_probability", 1.0)
+        )
+        self.augmentation_decision_version = str(
+            kwargs.get(
+                "augmentation_decision_version",
+                AUGMENTATION_DECISION_VERSION,
+            )
+        )
+        for name, probability in (
+            ("query_only_msa_probability", self.query_only_msa_probability),
+            (
+                "pair_msa_as_unpaired_probability",
+                self.pair_msa_as_unpaired_probability,
+            ),
+            ("template_use_probability", self.template_use_probability),
+        ):
+            if not 0.0 <= probability <= 1.0:
+                raise ValueError(f"{name} must be in [0, 1], got {probability}")
+        msa_gate_probability = (
+            self.query_only_msa_probability
+            + self.pair_msa_as_unpaired_probability
+        )
+        if msa_gate_probability > 1.0:
+            raise ValueError(
+                "query_only_msa_probability + "
+                "pair_msa_as_unpaired_probability must be <= 1, got "
+                f"{msa_gate_probability}"
+            )
+        if not self.augmentation_decision_version.strip():
+            raise ValueError("augmentation_decision_version must be non-empty")
 
         # Configs for data filters
         self.max_n_token = kwargs.get("max_n_token", -1)
         self.min_n_token = kwargs.get("min_n_token", -1)
         self.pdb_list = kwargs.get("pdb_list", None)
-        if len(self.pdb_list) == 0:
+        if self.pdb_list is not None and len(self.pdb_list) == 0:
             self.pdb_list = None
         # Used for removing rows in the indices list. Column names and excluded values are specified in this dict.
         self.exclusion_dict = kwargs.get("exclusion", {})
+        self.remove_pure_nuc = kwargs.get("remove_pure_nuc", False)
         self.limits = kwargs.get(
             "limits", -1
         )  # Limit number of indices rows, mainly for test
@@ -123,7 +362,133 @@ class BaseSingleDataset(Dataset):
         self.template_featurizer = template_featurizer
 
         # Read data
-        self.indices_list = self.read_indices_list(indices_fpath)
+        if self.runtime_distillation_index is None:
+            self.indices_list = self.read_indices_list(indices_fpath)
+        else:
+            if not self.is_distillation:
+                raise ValueError(
+                    "runtime_index_dir requires is_distillation=True"
+                )
+            if self.random_sample_if_failed:
+                raise ValueError(
+                    "runtime distillation must fail closed; "
+                    "random_sample_if_failed must be False"
+                )
+            incompatible = {
+                "group_by_pdb_id": self.group_by_pdb_id,
+                "sort_by_n_token": self.sort_by_n_token,
+                "find_eval_chain_interface": self.find_eval_chain_interface,
+                "pdb_list": self.pdb_list is not None,
+                "max_n_token": self.max_n_token > 0,
+                "min_n_token": self.min_n_token > 0,
+                "exclusion": bool(self.exclusion_dict),
+                "limits": self.limits > 0,
+            }
+            enabled = [name for name, value in incompatible.items() if value]
+            if enabled:
+                raise ValueError(
+                    "runtime distillation does not support dataframe filters: "
+                    + ", ".join(enabled)
+                )
+            self.indices_list = self.runtime_distillation_index
+            logger.info(
+                "[%s] runtime distillation index: rows=%d clusters=%d dir=%s",
+                self.name,
+                len(self.runtime_distillation_index),
+                self.runtime_distillation_index.cluster_count,
+                self.runtime_distillation_index.runtime_dir,
+            )
+
+    @staticmethod
+    def _load_source_roots(
+        source_roots_fpath: Optional[Union[str, Path]],
+    ) -> dict[str, Path]:
+        """Load an optional ``root_id -> source directory`` mapping.
+
+        The mapping is only used by row-addressed distillation datasets.  An
+        empty mapping preserves the legacy flat ``bioassembly_dict_dir``
+        lookup exactly.
+        """
+        if source_roots_fpath is None:
+            return {}
+
+        roots_path = Path(source_roots_fpath).expanduser()
+        with roots_path.open("r", encoding="utf-8") as f:
+            document = json.load(f)
+        records = document.get("roots")
+        if not isinstance(records, list) or not records:
+            raise ValueError(
+                f"{roots_path} must contain a non-empty 'roots' list"
+            )
+
+        roots: dict[str, Path] = {}
+        for record in records:
+            if not isinstance(record, dict):
+                raise ValueError(
+                    f"{roots_path} contains a non-object roots entry"
+                )
+            root_id = str(record.get("root_id", "")).strip()
+            root_value = record.get("path")
+            if not root_id or not isinstance(root_value, str) or not root_value:
+                raise ValueError(
+                    f"{roots_path} roots entries require root_id and path"
+                )
+            if root_id in roots:
+                raise ValueError(
+                    f"{roots_path} contains duplicate root_id {root_id!r}"
+                )
+            root_path = Path(root_value).expanduser()
+            if not root_path.is_absolute():
+                root_path = roots_path.parent / root_path
+            roots[root_id] = root_path
+        return roots
+
+    def _resolve_row_addressed_distillation_paths(
+        self, sample_indice: pd.Series
+    ) -> tuple[Path, Path]:
+        """Resolve one catalog row to its nested bioassembly and direct A3M."""
+        runtime_index = getattr(self, "runtime_distillation_index", None)
+        if runtime_index is not None:
+            if "row_id" not in sample_indice or pd.isna(sample_indice["row_id"]):
+                raise ValueError("Runtime distillation sample is missing row_id")
+            paths = runtime_index.resolve_paths(int(sample_indice["row_id"]))
+            return paths.bioassembly_path, paths.a3m_path
+
+        missing = [
+            field
+            for field in ("source_root_id", "cif_relpath")
+            if field not in sample_indice or pd.isna(sample_indice[field])
+        ]
+        if missing:
+            raise ValueError(
+                "source_roots_fpath requires catalog columns: "
+                + ", ".join(missing)
+            )
+
+        root_id = str(sample_indice["source_root_id"]).strip()
+        if root_id not in self.source_roots:
+            raise KeyError(
+                f"Unknown source_root_id {root_id!r}; configured roots are "
+                f"{sorted(self.source_roots)}"
+            )
+
+        cif_relpath = PurePosixPath(str(sample_indice["cif_relpath"]).strip())
+        if (
+            cif_relpath.is_absolute()
+            or ".." in cif_relpath.parts
+            or not (
+                cif_relpath.name.lower().endswith(".cif")
+                or cif_relpath.name.lower().endswith(".cif.gz")
+            )
+        ):
+            raise ValueError(
+                f"Unsafe or non-CIF cif_relpath: {str(cif_relpath)!r}"
+            )
+
+        cif_path = self.source_roots[root_id].joinpath(*cif_relpath.parts)
+        basename = structure_basename(cif_relpath)
+        bioassembly_path = cif_path.parent / "bioassembly" / f"{basename}.pkl.gz"
+        return bioassembly_path, cif_path.parent / f"{basename}.a3m"
 
     @staticmethod
     def read_pdb_list(pdb_list: Union[list, str]) -> Optional[list]:
@@ -214,6 +579,32 @@ class BaseSingleDataset(Dataset):
             self.check_indices_list(
                 indices_list, f"exclusion_dict ({col_name}) filtering"
             )
+
+        # Filter pure nucleic acid data: keep only samples with at least one protein or ligand
+        if self.remove_pure_nuc:
+            cond_chain_nuc = (indices_list["type"] == "chain") & (
+                indices_list["mol_1_type"] == "nuc"
+            )
+            cond_interface_nuc_nuc = (
+                (indices_list["type"] == "interface")
+                & (indices_list["mol_1_type"] == "nuc")
+                & (indices_list["mol_2_type"] == "nuc")
+            )
+            remove_mask = cond_chain_nuc | cond_interface_nuc_nuc
+            removed_list = indices_list[remove_mask]
+            indices_list = indices_list[~remove_mask].reset_index(drop=True)
+            logger.info(
+                f"[removed pure nuc] #Rows: {len(removed_list)}"
+            )
+            if len(removed_list) > 0:
+                logger.info(
+                    f"[removed pure nuc] #PDB: {removed_list['pdb_id'].nunique()}"
+                )
+            logger.info(
+                f"[filtered by remove_pure_nuc] #Rows: {len(indices_list)}"
+            )
+            self.check_indices_list(indices_list, "remove_pure_nuc filtering")
+
         self.print_data_stats(indices_list)
 
         # Group by pdb_id
@@ -285,6 +676,8 @@ class BaseSingleDataset(Dataset):
         col2 = df["mol_2_type"].astype(str).str.replace("nan", "intra", regex=False)
         lo = np.where(col1.values <= col2.values, col1.values, col2.values)
         hi = np.where(col1.values <= col2.values, col2.values, col1.values)
+        lo = np.asarray(lo, dtype=str)
+        hi = np.asarray(hi, dtype=str)
         df["mol_group_type"] = np.char.add(np.char.add(lo, "_"), hi)
 
         group_size_dict = dict(df["mol_group_type"].value_counts())
@@ -324,7 +717,7 @@ class BaseSingleDataset(Dataset):
                 with open(fpath, "w") as f:
                     json.dump(data, f)
 
-    def __getitem__(self, idx: int):
+    def __getitem__(self, idx: Union[int, SampleOccurrence]):
         """
         Retrieves a data sample by processing the given index.
         If an error occurs, it attempts to handle it by either saving the error data or randomly sampling another index.
@@ -335,15 +728,40 @@ class BaseSingleDataset(Dataset):
         Returns:
             A dictionary containing the processed data sample.
         """
-        # Try at most 10 times
+        idx, occurrence = split_sample_index(idx)
+        msa_mode = self._msa_mode_decision(occurrence)
+        template_use_requested = self._augmentation_decision(
+            occurrence,
+            probability=self.template_use_probability,
+            stream_name="template_use",
+        )
+
+        # Try at most 10 times. The occurrence-level augmentation decisions are
+        # intentionally kept fixed if a broken row is replaced within this
+        # dataset.
+        last_error = None
         for _ in range(10):
             try:
-                data = self.process_one(idx)
+                data = self.process_one(
+                    idx,
+                    msa_mode=msa_mode,
+                    template_use_requested=template_use_requested,
+                    sample_occurrence=occurrence,
+                )
                 return data
             except Exception as e:
+                last_error = e
                 error_message = f"{e} at idx {idx}:\n{traceback.format_exc()}"
                 self.save_error_data(idx, error_message)
 
+                # A required offline cache is a dataset-level contract, not a
+                # broken-row condition. Never hide missing/corrupt cache files
+                # by replacing the target with a random sample.
+                if isinstance(e, SequenceTemplateCacheError):
+                    logger.exception(
+                        f"[fatal sequence template cache error] {error_message}"
+                    )
+                    raise
                 if self.random_sample_if_failed:
                     logger.exception(f"[skip data {idx}] {error_message}")
                     # Random sample an index
@@ -351,13 +769,78 @@ class BaseSingleDataset(Dataset):
                     continue
                 else:
                     raise Exception(e)
-        return data
+        raise RuntimeError(
+            "failed to produce a valid sample after 10 replacement attempts"
+        ) from last_error
+
+    def _augmentation_decision(
+        self,
+        occurrence: Optional[SampleOccurrence],
+        *,
+        probability: float,
+        stream_name: str,
+    ) -> bool:
+        return deterministic_occurrence_bernoulli(
+            occurrence,
+            probability=probability,
+            stream_name=stream_name,
+            algorithm_version=self.augmentation_decision_version,
+        )
+
+    def _msa_mode_decision(
+        self,
+        occurrence: Optional[SampleOccurrence],
+    ) -> str:
+        query_probability = self.query_only_msa_probability
+        unpaired_probability = self.pair_msa_as_unpaired_probability
+        if query_probability == 0.0 and unpaired_probability == 0.0:
+            return MSA_MODE_CONFIGURED
+        return deterministic_occurrence_categorical(
+            occurrence,
+            probabilities=(
+                (MSA_MODE_QUERY_ONLY, query_probability),
+                (MSA_MODE_UNPAIRED_SHUFFLE, unpaired_probability),
+                (
+                    MSA_MODE_SPECIES_PAIRED,
+                    1.0 - query_probability - unpaired_probability,
+                ),
+            ),
+            stream_name="msa_mode",
+            algorithm_version=self.augmentation_decision_version,
+        )
 
     def _get_bioassembly_data(
         self, idx: int
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         sample_indice = self._get_sample_indice(idx=idx)
-        if self.bioassembly_dict_dir is not None:
+        direct_protein_unpaired_msa_fpath = None
+        if self.source_roots:
+            (
+                bioassembly_dict_fpath,
+                direct_protein_unpaired_msa_fpath,
+            ) = self._resolve_row_addressed_distillation_paths(sample_indice)
+        elif self.bioassembly_relpath_column is not None:
+            column = str(self.bioassembly_relpath_column)
+            if column not in sample_indice or pd.isna(sample_indice[column]):
+                raise ValueError(
+                    f"Missing bioassembly relative path column {column!r}"
+                )
+            relative_path = PurePosixPath(
+                str(sample_indice[column]).strip()
+            )
+            if (
+                relative_path.is_absolute()
+                or ".." in relative_path.parts
+                or not str(relative_path).endswith(".pkl.gz")
+            ):
+                raise ValueError(
+                    "Unsafe bioassembly relative path: "
+                    f"{str(relative_path)!r}"
+                )
+            bioassembly_dict_fpath = Path(
+                self.bioassembly_dict_dir
+            ).joinpath(*relative_path.parts)
+        elif self.bioassembly_dict_dir is not None:
             bioassembly_dict_fpath = os.path.join(
                 self.bioassembly_dict_dir, sample_indice.pdb_id + ".pkl.gz"
             )
@@ -367,8 +850,32 @@ class BaseSingleDataset(Dataset):
         bioassembly_dict = DataPipeline.get_data_bioassembly(
             bioassembly_dict_fpath=bioassembly_dict_fpath
         )
+        if direct_protein_unpaired_msa_fpath is not None:
+            expected_root_id = str(sample_indice["source_root_id"])
+            expected_cif_relpath = str(sample_indice["cif_relpath"])
+            stored_root_id = bioassembly_dict.get("source_root_id")
+            stored_cif_relpath = bioassembly_dict.get("source_cif_relpath")
+            if (
+                stored_root_id is not None
+                and str(stored_root_id) != expected_root_id
+            ):
+                raise ValueError(
+                    "Bioassembly source_root_id does not match runtime index: "
+                    f"{stored_root_id!r} != {expected_root_id!r}"
+                )
+            if (
+                stored_cif_relpath is not None
+                and str(stored_cif_relpath) != expected_cif_relpath
+            ):
+                raise ValueError(
+                    "Bioassembly source_cif_relpath does not match runtime "
+                    f"index: {stored_cif_relpath!r} != "
+                    f"{expected_cif_relpath!r}"
+                )
+            bioassembly_dict[DIRECT_PROTEIN_UNPAIRED_MSA_PATH] = str(
+                direct_protein_unpaired_msa_fpath
+            )
         bioassembly_dict["pdb_id"] = sample_indice.pdb_id
-
         entity_pair_to_chain_pairs = bioassembly_dict.get("entity_pair_to_chain_pairs")
         if sample_indice["type"] == "interface" and entity_pair_to_chain_pairs:
             entity1 = sample_indice.entity_1_id
@@ -461,7 +968,14 @@ class BaseSingleDataset(Dataset):
         return atom_array
 
     def process_one(
-        self, idx: int, return_atom_token_array: bool = False
+        self,
+        idx: int,
+        return_atom_token_array: bool = False,
+        *,
+        query_only_msa: bool = False,
+        msa_mode: Optional[str] = None,
+        template_use_requested: bool = True,
+        sample_occurrence: Optional[SampleOccurrence] = None,
     ) -> dict[str, dict]:
         """
         Processes a single data sample by retrieving bioassembly data, applying various transformations, and cropping the data.
@@ -474,12 +988,108 @@ class BaseSingleDataset(Dataset):
         Returns:
             A dict containing the input features, labels, basic_info and optionally the processed atom and token arrays.
         """
+        process_start = time.perf_counter()
+        if msa_mode is None:
+            msa_mode = (
+                MSA_MODE_QUERY_ONLY if query_only_msa else MSA_MODE_CONFIGURED
+            )
+        valid_msa_modes = {
+            MSA_MODE_CONFIGURED,
+            MSA_MODE_QUERY_ONLY,
+            MSA_MODE_UNPAIRED_SHUFFLE,
+            MSA_MODE_SPECIES_PAIRED,
+        }
+        if msa_mode not in valid_msa_modes:
+            raise ValueError(f"unsupported msa_mode: {msa_mode!r}")
+        if query_only_msa and msa_mode != MSA_MODE_QUERY_ONLY:
+            raise ValueError(
+                "query_only_msa=True conflicts with "
+                f"msa_mode={msa_mode!r}"
+            )
+        query_only_msa = msa_mode == MSA_MODE_QUERY_ONLY
+        pair_msa_as_unpaired_only = (
+            True if msa_mode == MSA_MODE_UNPAIRED_SHUFFLE else None
+        )
+        shuffle_pair_msa_when_unpaired_only = (
+            True if msa_mode == MSA_MODE_UNPAIRED_SHUFFLE else None
+        )
+        if msa_mode == MSA_MODE_SPECIES_PAIRED:
+            pair_msa_as_unpaired_only = False
+            shuffle_pair_msa_when_unpaired_only = False
+        elif msa_mode == MSA_MODE_QUERY_ONLY:
+            pair_msa_as_unpaired_only = False
+            shuffle_pair_msa_when_unpaired_only = False
+        effective_pair_as_unpaired = (
+            bool(getattr(self.msa_featurizer, "pair_msa_as_unpaired_only", False))
+            if pair_msa_as_unpaired_only is None
+            else pair_msa_as_unpaired_only
+        )
+        effective_shuffle = (
+            bool(
+                getattr(
+                    self.msa_featurizer,
+                    "shuffle_pair_msa_when_unpaired_only",
+                    False,
+                )
+            )
+            if shuffle_pair_msa_when_unpaired_only is None
+            else shuffle_pair_msa_when_unpaired_only
+        )
+        if query_only_msa:
+            effective_pair_as_unpaired = False
+            effective_shuffle = False
+        virtual_segment_shuffle_seed = (
+            deterministic_occurrence_seed(
+                sample_occurrence,
+                stream_name=VIRTUAL_SEGMENT_MSA_SHUFFLE_STREAM,
+                algorithm_version=self.augmentation_decision_version,
+            )
+            if (
+                msa_mode == MSA_MODE_UNPAIRED_SHUFFLE
+                and sample_occurrence is not None
+            )
+            else None
+        )
+        msa_shuffle_variant_seed = (
+            deterministic_occurrence_seed(
+                sample_occurrence,
+                stream_name=MULTICHAIN_MSA_SHUFFLE_VARIANT_STREAM,
+                algorithm_version=self.augmentation_decision_version,
+            )
+            if (
+                effective_pair_as_unpaired
+                and effective_shuffle
+                and sample_occurrence is not None
+                and bool(
+                    getattr(
+                        self.msa_featurizer,
+                        "enable_multichain_msa_shuffle_variant_sampling",
+                        False,
+                    )
+                )
+            )
+            else None
+        )
+        query_only_chain_selection_seed = (
+            deterministic_occurrence_seed(
+                sample_occurrence,
+                stream_name=QUERY_ONLY_CHAIN_SELECTION_STREAM,
+                algorithm_version=self.augmentation_decision_version,
+            )
+            if (
+                msa_mode == MSA_MODE_QUERY_ONLY
+                and sample_occurrence is not None
+            )
+            else None
+        )
 
+        bioassembly_start = time.perf_counter()
         (
             sample_indice,
             bioassembly_dict,
             bioassembly_dict_fpath,
         ) = self._get_bioassembly_data(idx=idx)
+        bioassembly_load_seconds = time.perf_counter() - bioassembly_start
 
         if self.use_reference_chains_only:
             # Get the reference chains
@@ -526,6 +1136,7 @@ class BaseSingleDataset(Dataset):
         max_entity_mol_id = bioassembly_dict["atom_array"].entity_mol_id.max()
 
         # Crop
+        crop_start = time.perf_counter()
         (
             crop_method,
             cropped_token_array,
@@ -536,9 +1147,22 @@ class BaseSingleDataset(Dataset):
         ) = self.crop(
             sample_indice=sample_indice,
             bioassembly_dict=bioassembly_dict,
+            query_only_msa=query_only_msa,
+            pair_msa_as_unpaired_only=pair_msa_as_unpaired_only,
+            shuffle_pair_msa_when_unpaired_only=(
+                shuffle_pair_msa_when_unpaired_only
+            ),
+            virtual_segment_shuffle_seed=virtual_segment_shuffle_seed,
+            msa_shuffle_variant_seed=msa_shuffle_variant_seed,
+            query_only_chain_selection_seed=(
+                query_only_chain_selection_seed
+            ),
+            template_use_requested=template_use_requested,
             **self.cropping_configs,
         )
+        crop_seconds = time.perf_counter() - crop_start
 
+        feature_label_start = time.perf_counter()
         feat, label, label_full = self.get_feature_and_label(
             idx=idx,
             token_array=cropped_token_array,
@@ -549,6 +1173,24 @@ class BaseSingleDataset(Dataset):
             is_spatial_crop="spatial" in crop_method.lower(),
             max_entity_mol_id=max_entity_mol_id,
         )
+        feature_label_seconds = time.perf_counter() - feature_label_start
+        diffusion_supervised_token_count = (
+            _count_diffusion_supervised_feature_tokens(
+                features=feat,
+                labels=label,
+                protein_only=self.disable_non_protein_diffusion_weights,
+            )
+        )
+        if (
+            diffusion_supervised_token_count
+            < self.min_diffusion_supervised_tokens
+        ):
+            raise RuntimeError(
+                "final feature/label tensors have too few "
+                "diffusion-supervised tokens: "
+                f"{diffusion_supervised_token_count} < "
+                f"{self.min_diffusion_supervised_tokens}"
+            )
 
         # Basic info, e.g. dimension related items
         basic_info = {
@@ -560,13 +1202,315 @@ class BaseSingleDataset(Dataset):
             "N_asym": torch.tensor([len(torch.unique(feat["asym_id"]))]),
             "N_token": torch.tensor([feat["token_index"].shape[0]]),
             "N_atom": torch.tensor([feat["atom_to_token_idx"].shape[0]]),
+            "N_diffusion_supervised_token": torch.tensor(
+                [diffusion_supervised_token_count],
+                dtype=torch.int64,
+            ),
             "N_msa": torch.tensor([feat["msa"].shape[0]]),
             "bioassembly_dict_fpath": bioassembly_dict_fpath,
             "N_msa_prot_pair": torch.tensor([feat["prot_pair_num_alignments"]]),
             "N_msa_prot_unpair": torch.tensor([feat["prot_unpair_num_alignments"]]),
             "N_msa_rna_pair": torch.tensor([feat["rna_pair_num_alignments"]]),
             "N_msa_rna_unpair": torch.tensor([feat["rna_unpair_num_alignments"]]),
+            "msa_mode": msa_mode,
+            "query_only_msa": torch.tensor([query_only_msa], dtype=torch.bool),
+            "msa_query_only": torch.tensor([query_only_msa], dtype=torch.bool),
+            "unpaired_msa": torch.tensor(
+                [msa_mode == MSA_MODE_UNPAIRED_SHUFFLE],
+                dtype=torch.bool,
+            ),
+            "pair_msa_as_unpaired_only": torch.tensor(
+                [effective_pair_as_unpaired],
+                dtype=torch.bool,
+            ),
+            "shuffle_pair_msa_when_unpaired_only": torch.tensor(
+                [effective_shuffle],
+                dtype=torch.bool,
+            ),
+            "template_use_requested": torch.tensor(
+                [template_use_requested], dtype=torch.bool
+            ),
+            "template_dropout_applied": torch.tensor(
+                [not template_use_requested], dtype=torch.bool
+            ),
+            "N_template_valid": torch.tensor(
+                [self._count_valid_templates(cropped_template_features)],
+                dtype=torch.int64,
+            ),
+            "bioassembly_load_seconds": bioassembly_load_seconds,
+            "crop_seconds": crop_seconds,
+            "feature_label_seconds": feature_label_seconds,
         }
+        if self.msa_featurizer is not None:
+            msa_profile = self.msa_featurizer.get_last_profile()
+            basic_info["msa_featurizer_seconds"] = float(
+                msa_profile.get("elapsed_seconds", 0.0)
+            )
+            basic_info["N_msa_virtual_segment"] = torch.tensor(
+                [int(msa_profile.get("virtual_segment_count", 0))],
+                dtype=torch.int64,
+            )
+            basic_info["msa_virtual_segment_shuffle_applied"] = torch.tensor(
+                [
+                    bool(
+                        msa_profile.get(
+                            "virtual_segment_shuffle_applied",
+                            False,
+                        )
+                    )
+                ],
+                dtype=torch.bool,
+            )
+            basic_info["N_msa_shuffle_group"] = torch.tensor(
+                [int(msa_profile.get("msa_shuffle_group_count", 0))],
+                dtype=torch.int64,
+            )
+            basic_info["msa_shuffle_requested_variant_code"] = torch.tensor(
+                [
+                    int(
+                        msa_profile.get(
+                            "msa_shuffle_requested_variant_code",
+                            0,
+                        )
+                    )
+                ],
+                dtype=torch.int64,
+            )
+            basic_info["msa_shuffle_variant_eligible"] = torch.tensor(
+                [
+                    bool(
+                        msa_profile.get(
+                            "msa_shuffle_variant_eligible",
+                            False,
+                        )
+                    )
+                ],
+                dtype=torch.bool,
+            )
+            basic_info["msa_shuffle_variant_applied"] = torch.tensor(
+                [
+                    bool(
+                        msa_profile.get(
+                            "msa_shuffle_variant_applied",
+                            False,
+                        )
+                    )
+                ],
+                dtype=torch.bool,
+            )
+            basic_info[
+                "msa_shuffle_whole_physical_chain_applied"
+            ] = torch.tensor(
+                [
+                    bool(
+                        msa_profile.get(
+                            "msa_shuffle_whole_physical_chain_applied",
+                            False,
+                        )
+                    )
+                ],
+                dtype=torch.bool,
+            )
+            basic_info["N_msa_crop_protein_chain"] = torch.tensor(
+                [
+                    int(
+                        msa_profile.get(
+                            "msa_shuffle_crop_protein_chain_count",
+                            msa_profile.get(
+                                "query_only_crop_protein_chain_count",
+                                0,
+                            ),
+                        )
+                    )
+                ],
+                dtype=torch.int64,
+            )
+            basic_info["N_msa_query_only_protein_chain"] = torch.tensor(
+                [
+                    int(
+                        msa_profile.get(
+                            "query_only_selected_protein_chain_count",
+                            0,
+                        )
+                    )
+                ],
+                dtype=torch.int64,
+            )
+            basic_info["N_msa_retained_protein_chain"] = torch.tensor(
+                [
+                    int(
+                        msa_profile.get(
+                            "query_only_retained_protein_chain_count",
+                            0,
+                        )
+                    )
+                ],
+                dtype=torch.int64,
+            )
+            basic_info["msa_partial_query_only_applied"] = torch.tensor(
+                [
+                    bool(
+                        msa_profile.get(
+                            "query_only_partial_applied",
+                            False,
+                        )
+                    )
+                ],
+                dtype=torch.bool,
+            )
+            basic_info["msa_global_query_only_applied"] = torch.tensor(
+                [
+                    bool(
+                        msa_profile.get(
+                            "query_only_global_applied",
+                            False,
+                        )
+                    )
+                ],
+                dtype=torch.bool,
+            )
+            basic_info[
+                "N_openfold3_representative_query_mismatch"
+            ] = torch.tensor(
+                [
+                    int(
+                        msa_profile.get(
+                            "openfold3_representative_query_mismatch_count",
+                            0,
+                        )
+                    )
+                ],
+                dtype=torch.int64,
+            )
+            basic_info["N_openfold3_representative_remap"] = torch.tensor(
+                [
+                    int(
+                        msa_profile.get(
+                            "openfold3_representative_remap_count",
+                            0,
+                        )
+                    )
+                ],
+                dtype=torch.int64,
+            )
+            basic_info[
+                "N_openfold3_representative_query_only_fallback"
+            ] = torch.tensor(
+                [
+                    int(
+                        msa_profile.get(
+                            "openfold3_representative_query_only_fallback_count",
+                            0,
+                        )
+                    )
+                ],
+                dtype=torch.int64,
+            )
+            basic_info["N_openfold3_explicit_query_only"] = torch.tensor(
+                [
+                    int(
+                        msa_profile.get(
+                            "openfold3_explicit_query_only_chain_count",
+                            0,
+                        )
+                    )
+                ],
+                dtype=torch.int64,
+            )
+        if self.template_featurizer is not None:
+            template_profile = self.template_featurizer.get_last_profile()
+            basic_info["template_featurizer_seconds"] = float(
+                template_profile.get("elapsed_seconds", 0.0)
+            )
+            template_phase_seconds = {
+                phase: sum(
+                    float(chain_profile.get("time_track", {}).get(phase, 0.0))
+                    for chain_profile in template_profile.get("chain_profiles", [])
+                )
+                for phase in ("load", "align", "feature")
+            }
+            basic_info.update(
+                {
+                    "template_load_seconds": template_phase_seconds["load"],
+                    "template_align_seconds": template_phase_seconds["align"],
+                    "template_feature_seconds": template_phase_seconds["feature"],
+                    "sequence_template_cache_load_seconds": float(
+                        template_profile.get(
+                            "sequence_template_cache_load_seconds",
+                            0.0,
+                        )
+                    ),
+                    "sequence_template_cache_files_loaded": int(
+                        template_profile.get(
+                            "sequence_template_cache_files_loaded",
+                            0,
+                        )
+                    ),
+                    "sequence_template_cache_candidates": int(
+                        template_profile.get(
+                            "sequence_template_cache_candidates",
+                            0,
+                        )
+                    ),
+                    "sequence_template_cache_selected": int(
+                        template_profile.get(
+                            "sequence_template_cache_selected",
+                            0,
+                        )
+                    ),
+                    "sequence_template_cache_reuses": int(
+                        template_profile.get(
+                            "sequence_template_cache_reuses",
+                            0,
+                        )
+                    ),
+                    "N_sequence_template_cache_chain_dummy_fallback_unique_sequence": torch.tensor(
+                        [
+                            int(
+                                template_profile.get(
+                                    "sequence_template_cache_chain_dummy_fallback_unique_sequence_count",
+                                    0,
+                                )
+                            )
+                        ],
+                        dtype=torch.int64,
+                    ),
+                    "N_sequence_template_cache_chain_dummy_fallback_chain": torch.tensor(
+                        [
+                            int(
+                                template_profile.get(
+                                    "sequence_template_cache_chain_dummy_fallback_affected_chain_count",
+                                    0,
+                                )
+                            )
+                        ],
+                        dtype=torch.int64,
+                    ),
+                }
+            )
+            fallback_reason_counts = template_profile.get(
+                "sequence_template_cache_chain_dummy_fallback_reason_counts",
+                {},
+            )
+            for reason in SEQUENCE_TEMPLATE_CACHE_ERROR_REASONS:
+                basic_info[
+                    "N_sequence_template_cache_chain_dummy_fallback_reason_"
+                    f"{reason}"
+                ] = torch.tensor(
+                    [int(fallback_reason_counts.get(reason, 0))],
+                    dtype=torch.int64,
+                )
+        if sample_occurrence is not None:
+            basic_info.update(
+                {
+                    "sample_sampler_epoch": torch.tensor(
+                        [sample_occurrence.sampler_epoch], dtype=torch.int64
+                    ),
+                    "sample_global_position": torch.tensor(
+                        [sample_occurrence.global_position], dtype=torch.int64
+                    ),
+                }
+            )
 
         for mol_type in ("protein", "ligand", "rna", "dna"):
             abbr = {"protein": "prot", "ligand": "lig"}
@@ -593,11 +1537,23 @@ class BaseSingleDataset(Dataset):
             "label_full_dict": label_full,
             "basic": basic_info,
         }
+        basic_info["data_process_seconds"] = time.perf_counter() - process_start
 
         if return_atom_token_array:
             data["cropped_atom_array"] = cropped_atom_array
             data["cropped_token_array"] = cropped_token_array
         return data
+
+    @staticmethod
+    def _count_valid_templates(template_features: dict[str, Any]) -> int:
+        atom_mask = template_features.get("template_atom_mask")
+        if atom_mask is None:
+            return 0
+        atom_mask = np.asarray(atom_mask)
+        if atom_mask.ndim < 2 or atom_mask.shape[0] == 0:
+            return 0
+        valid_axes = tuple(range(1, atom_mask.ndim))
+        return int(np.any(atom_mask.astype(bool), axis=valid_axes).sum())
 
     def crop(
         self,
@@ -609,6 +1565,14 @@ class BaseSingleDataset(Dataset):
         spatial_crop_complete_lig: bool = True,
         drop_last: bool = True,
         remove_metal: bool = True,
+        max_nuc_tokens: int = -1,
+        query_only_msa: bool = False,
+        pair_msa_as_unpaired_only: Optional[bool] = None,
+        shuffle_pair_msa_when_unpaired_only: Optional[bool] = None,
+        virtual_segment_shuffle_seed: Optional[int] = None,
+        query_only_chain_selection_seed: Optional[int] = None,
+        template_use_requested: bool = True,
+        msa_shuffle_variant_seed: Optional[int] = None,
     ) -> tuple[str, TokenArray, AtomArray, dict[str, Any], dict[str, Any]]:
         """
         Crops the bioassembly data based on the specified configurations.
@@ -617,7 +1581,41 @@ class BaseSingleDataset(Dataset):
             A tuple containing the cropping method, cropped token array, cropped atom array,
                 cropped MSA features, and cropped template features.
         """
-        return DataPipeline.crop(
+        required_token_mask = None
+        min_required_tokens = 1
+        diffusion_supervised_token_mask = None
+        if self.min_diffusion_supervised_tokens > 0:
+            diffusion_supervised_token_mask = (
+                _diffusion_supervised_token_mask(
+                    token_array=bioassembly_dict["token_array"],
+                    atom_array=bioassembly_dict["atom_array"],
+                    protein_only=(
+                        self.disable_non_protein_diffusion_weights
+                    ),
+                )
+            )
+        if self.require_resolved_protein_crop:
+            required_token_mask = (
+                diffusion_supervised_token_mask
+                if (
+                    self.disable_non_protein_diffusion_weights
+                    and diffusion_supervised_token_mask is not None
+                )
+                else _resolved_protein_token_mask(
+                    token_array=bioassembly_dict["token_array"],
+                    atom_array=bioassembly_dict["atom_array"],
+                )
+            )
+            # Keep the protein-crop constraint at least as strong as the
+            # configured diffusion minimum even when a future run supervises
+            # all molecule types. This avoids satisfying K with ligand/nucleic
+            # tokens while retaining only one protein token.
+            min_required_tokens = max(
+                1,
+                self.min_diffusion_supervised_tokens,
+            )
+
+        crop_result = DataPipeline.crop(
             one_sample=sample_indice,
             bioassembly_dict=bioassembly_dict,
             crop_size=crop_size,
@@ -628,7 +1626,57 @@ class BaseSingleDataset(Dataset):
             spatial_crop_complete_lig=spatial_crop_complete_lig,
             drop_last=drop_last,
             remove_metal=remove_metal,
+            max_nuc_tokens=max_nuc_tokens,
+            query_only_msa=query_only_msa,
+            pair_msa_as_unpaired_only=pair_msa_as_unpaired_only,
+            shuffle_pair_msa_when_unpaired_only=(
+                shuffle_pair_msa_when_unpaired_only
+            ),
+            virtual_segment_shuffle_seed=virtual_segment_shuffle_seed,
+            msa_shuffle_variant_seed=msa_shuffle_variant_seed,
+            query_only_chain_selection_seed=(
+                query_only_chain_selection_seed
+            ),
+            template_use_requested=template_use_requested,
+            required_token_mask=required_token_mask,
+            min_required_tokens=min_required_tokens,
+            supervision_token_mask=diffusion_supervised_token_mask,
+            min_supervision_tokens=self.min_diffusion_supervised_tokens,
         )
+        cropped_token_array = crop_result[1]
+        cropped_atom_array = crop_result[2]
+        if self.min_diffusion_supervised_tokens > 0:
+            cropped_diffusion_token_count = int(
+                _diffusion_supervised_token_mask(
+                    token_array=cropped_token_array,
+                    atom_array=cropped_atom_array,
+                    protein_only=(
+                        self.disable_non_protein_diffusion_weights
+                    ),
+                ).sum()
+            )
+            if (
+                cropped_diffusion_token_count
+                < self.min_diffusion_supervised_tokens
+            ):
+                raise RuntimeError(
+                    "crop has too few diffusion-supervised tokens: "
+                    f"{cropped_diffusion_token_count} < "
+                    f"{self.min_diffusion_supervised_tokens}"
+                )
+        if self.require_resolved_protein_crop:
+            resolved_protein_atom_count = int(
+                np.logical_and(
+                    cropped_atom_array.is_protein,
+                    cropped_atom_array.is_resolved,
+                ).sum()
+            )
+            if resolved_protein_atom_count == 0:
+                raise RuntimeError(
+                    "require_resolved_protein_crop requires at least one "
+                    "resolved protein atom in every crop"
+                )
+        return crop_result
 
     def _get_sample_indice(self, idx: int) -> pd.Series:
         """
@@ -641,6 +1689,50 @@ class BaseSingleDataset(Dataset):
         Returns:
             A pandas Series containing the sample indice.
         """
+        runtime_index = getattr(self, "runtime_distillation_index", None)
+        if runtime_index is not None:
+            root_id, cif_relpath = (
+                runtime_index.get_address(idx)
+            )
+            cluster_id, cluster_size = (
+                runtime_index.get_row_cluster(idx)
+            )
+            pdb_id = structure_basename(cif_relpath)
+            resolved = runtime_index.resolve_paths(idx)
+            return pd.Series(
+                {
+                    "entity_1_id": "1",
+                    "chain_1_id": "A",
+                    "mol_1_type": "prot",
+                    "cluster_1_id": cluster_id,
+                    "entity_2_id": np.nan,
+                    "chain_2_id": np.nan,
+                    "mol_2_type": np.nan,
+                    "cluster_2_id": np.nan,
+                    "cluster_id": cluster_id,
+                    "pdb_id": pdb_id,
+                    "release_date": "9999-12-31",
+                    "num_tokens": -1,
+                    "num_prot_chains": 1,
+                    "resolution": -1.0,
+                    "type": "chain",
+                    "mol_type_group": "intra_prot",
+                    "sub_mol_1_type": "prot",
+                    "sub_mol_2_type": np.nan,
+                    "eval_type": "intra_prot",
+                    "row_id": idx,
+                    "source_root_id": root_id,
+                    "cif_relpath": cif_relpath,
+                    "a3m_relpath": resolved.a3m_path.relative_to(
+                        runtime_index.source_roots[root_id]
+                    ).as_posix(),
+                    "bioassembly_relpath": resolved.bioassembly_path.relative_to(
+                        runtime_index.source_roots[root_id]
+                    ).as_posix(),
+                    "global_id": resolved.global_id,
+                    "cluster_size": cluster_size,
+                }
+            )
         if self.group_by_pdb_id:
             # Row-0 of PDB-idx
             sample_indice = self.indices_list[idx].iloc[0]
@@ -649,6 +1741,8 @@ class BaseSingleDataset(Dataset):
         return sample_indice
 
     def _get_pdb_indice(self, idx: int) -> pd.core.series.Series:
+        if getattr(self, "runtime_distillation_index", None) is not None:
+            return self._get_sample_indice(idx).to_frame().T
         if self.group_by_pdb_id:
             pdb_indice = self.indices_list[idx].copy()
         else:
@@ -889,6 +1983,14 @@ class BaseSingleDataset(Dataset):
 
         # Is_distillation
         features_dict["is_distillation"] = torch.tensor([self.is_distillation])
+        features_dict["disable_non_protein_diffusion_weights"] = torch.tensor(
+            [self.disable_non_protein_diffusion_weights],
+            dtype=torch.bool,
+        )
+        features_dict["min_diffusion_supervised_tokens"] = torch.tensor(
+            [self.min_diffusion_supervised_tokens],
+            dtype=torch.int64,
+        )
         if self.is_distillation is True:
             features_dict["resolution"] = torch.tensor([-1.0])
         return features_dict, labels_dict, label_full_dict
@@ -913,6 +2015,8 @@ def get_msa_featurizer(configs, dataset_name: str, stage: str) -> Optional[Calla
     if "msa" in (dataset_config := configs["data"][dataset_name]):
         for k, v in dataset_config["msa"].items():
             msa_args[k] = v
+    max_size_config = getattr(msa_args, "max_size", {})
+    max_msa_size = max_size_config.get(stage, max_size_config.get("train", 16384))
     return MSAFeaturizer(
         dataset_name=msa_args.dataset_name,
         prot_seq_or_filename_to_msadir_jsons=msa_args.prot_seq_or_filename_to_msadir_jsons,
@@ -925,6 +2029,78 @@ def get_msa_featurizer(configs, dataset_name: str, stage: str) -> Optional[Calla
         rna_indexing_methods=msa_args.rna_indexing_methods,
         enable_prot_msa=msa_args.enable_prot_msa,
         enable_rna_msa=msa_args.enable_rna_msa,
+        max_msa_size=max_msa_size,
+        pair_msa_as_unpaired_only=msa_args.pair_msa_as_unpaired_only,
+        shuffle_pair_msa_when_unpaired_only=getattr(
+            msa_args, "shuffle_pair_msa_when_unpaired_only", False
+        ),
+        enable_virtual_segment_msa_shuffle=getattr(
+            msa_args,
+            "enable_virtual_segment_msa_shuffle",
+            False,
+        ),
+        virtual_segment_residue_gap=getattr(
+            msa_args,
+            "virtual_segment_residue_gap",
+            24,
+        ),
+        virtual_segment_min_length=getattr(
+            msa_args,
+            "virtual_segment_min_length",
+            9,
+        ),
+        enable_multichain_msa_shuffle_variant_sampling=getattr(
+            msa_args,
+            "enable_multichain_msa_shuffle_variant_sampling",
+            False,
+        ),
+        multichain_msa_shuffle_segment_probability=getattr(
+            msa_args,
+            "multichain_msa_shuffle_segment_probability",
+            0.5,
+        ),
+        enable_crop_aware_partial_query_only=getattr(
+            msa_args,
+            "enable_crop_aware_partial_query_only",
+            False,
+        ),
+        partial_query_only_max_chains=getattr(
+            msa_args,
+            "partial_query_only_max_chains",
+            2,
+        ),
+        openfold3_alignment_npz_dirs=getattr(
+            msa_args,
+            "openfold3_alignment_npz_dirs",
+            (),
+        ),
+        max_input_paired_msa_depth=(
+            getattr(
+                msa_args,
+                "max_input_paired_msa_depth",
+                max_msa_size,
+            )
+            if stage == "train"
+            else None
+        ),
+        max_input_unpaired_msa_depth=(
+            getattr(
+                msa_args,
+                "max_input_unpaired_msa_depth",
+                max_msa_size,
+            )
+            if stage == "train"
+            else None
+        ),
+        independent_pairing_non_pairing_budget=(
+            getattr(
+                msa_args,
+                "independent_pairing_non_pairing_budget",
+                False,
+            )
+            if stage == "train"
+            else False
+        ),
     )
 
 
@@ -938,6 +2114,20 @@ def get_template_featurizer(
     if "template" in (dataset_config := configs["data"][dataset_name]):
         for k, v in dataset_config["template"].items():
             template_args[k] = v
+    emit_dummy_when_disabled = template_args.get(
+        "emit_dummy_template_when_disabled",
+        False,
+    )
+    if not isinstance(emit_dummy_when_disabled, (bool, np.bool_)):
+        raise TypeError(
+            "emit_dummy_template_when_disabled must be a boolean, "
+            f"got {type(emit_dummy_when_disabled).__name__}: "
+            f"{emit_dummy_when_disabled!r}"
+        )
+    if not template_args.get("enable_prot_template", True):
+        if stage == "train" and emit_dummy_when_disabled:
+            return DummyTemplateFeaturizer(max_templates=4)
+        return None
     template_args.update(
         {
             "stage": stage,
@@ -1001,10 +2191,80 @@ class WeightedMultiDataset(Dataset):
     def __len__(self) -> int:
         return len(self.merged_datapoint_weights)
 
-    def __getitem__(self, index: int) -> dict[str, dict]:
-        return self.datasets[self.dataset_indices[index]][
-            self.within_dataset_indices[index]
+    def __getitem__(self, index: Union[int, SampleOccurrence]) -> dict[str, dict]:
+        index, occurrence = split_sample_index(index)
+        dataset_index = self.dataset_indices[index]
+        child_index = self.within_dataset_indices[index]
+        if occurrence is not None:
+            child_index = occurrence.with_index(child_index)
+        data = self.datasets[dataset_index][child_index]
+        data.setdefault("basic", {})["dataset_name"] = self.dataset_names[dataset_index]
+        return data
+
+
+class HierarchicalWeightedMultiDataset(Dataset):
+    """Flatten datasets while retaining compact child sampling definitions.
+
+    Unlike :class:`WeightedMultiDataset`, this container does not materialize
+    one global weight tensor or Python row-to-dataset lists. The matching
+    hierarchical sampler first selects a child using its outer mass and then
+    asks that child's compact sampling definition for a local row.
+    """
+
+    def __init__(
+        self,
+        datasets: list[Dataset],
+        dataset_names: list[str],
+        child_sampling_specs: list[Any],
+        dataset_sample_weights: list[float],
+    ) -> None:
+        if not (
+            len(datasets)
+            == len(dataset_names)
+            == len(child_sampling_specs)
+            == len(dataset_sample_weights)
+        ):
+            raise ValueError(
+                "hierarchical datasets, names, sampling specs, and masses "
+                "must have equal lengths"
+            )
+        if not datasets:
+            raise ValueError("hierarchical training dataset cannot be empty")
+
+        self.datasets = datasets
+        self.dataset_names = dataset_names
+        self.hierarchical_child_sampling_specs = child_sampling_specs
+        self.hierarchical_dataset_masses = [
+            float(value) for value in dataset_sample_weights
         ]
+        offsets = [0]
+        for dataset in datasets:
+            size = len(dataset)
+            if size <= 0:
+                raise ValueError("every hierarchical child must be non-empty")
+            offsets.append(offsets[-1] + size)
+        self.hierarchical_dataset_offsets = tuple(offsets)
+
+    def __len__(self) -> int:
+        return self.hierarchical_dataset_offsets[-1]
+
+    def __getitem__(
+        self, index: Union[int, SampleOccurrence]
+    ) -> dict[str, dict]:
+        index, occurrence = split_sample_index(index)
+        if not 0 <= index < len(self):
+            raise IndexError(index)
+        dataset_index = bisect_right(
+            self.hierarchical_dataset_offsets, index
+        ) - 1
+        child_index = index - self.hierarchical_dataset_offsets[dataset_index]
+        if occurrence is not None:
+            child_index = occurrence.with_index(child_index)
+        data = self.datasets[dataset_index][child_index]
+        data.setdefault("basic", {})["dataset_name"] = self.dataset_names[
+            dataset_index
+        ]
+        return data
 
 
 def get_weighted_pdb_weight(
@@ -1162,7 +2422,10 @@ def get_sample_weights(
 
 def get_datasets(
     configs: ConfigDict, error_dir: Optional[str]
-) -> tuple[WeightedMultiDataset, dict[str, BaseSingleDataset]]:
+) -> tuple[
+    Union[WeightedMultiDataset, HierarchicalWeightedMultiDataset],
+    dict[str, BaseSingleDataset],
+]:
     """
     Get training and testing datasets given configs
 
@@ -1177,6 +2440,24 @@ def get_datasets(
     def _get_dataset_param(config_dict, dataset_name: str, stage: str):
         # Template_featurizer is under development
         # Lig_atom_rename/shuffle_mols/shuffle_sym_ids do not affect the performance very much
+        dataset_augmentation = config_dict.get("augmentation", {})
+        if stage == "train":
+            query_only_msa_probability = dataset_augmentation.get(
+                "query_only_msa_probability",
+                configs.data.get("query_only_msa_probability", 0.0),
+            )
+            pair_msa_as_unpaired_probability = dataset_augmentation.get(
+                "pair_msa_as_unpaired_probability",
+                configs.data.get("pair_msa_as_unpaired_probability", 0.0),
+            )
+            template_use_probability = dataset_augmentation.get(
+                "template_use_probability",
+                configs.data.get("template_use_probability", 1.0),
+            )
+        else:
+            query_only_msa_probability = 0.0
+            pair_msa_as_unpaired_probability = 0.0
+            template_use_probability = 1.0
         return {
             "name": dataset_name,
             **config_dict["base_info"],
@@ -1190,6 +2471,15 @@ def get_datasets(
             "shuffle_mols": config_dict.get("shuffle_mols", False),
             "shuffle_sym_ids": config_dict.get("shuffle_sym_ids", False),
             "constraint": config_dict.get("constraint", {}),
+            "query_only_msa_probability": query_only_msa_probability,
+            "pair_msa_as_unpaired_probability": (
+                pair_msa_as_unpaired_probability
+            ),
+            "template_use_probability": template_use_probability,
+            "augmentation_decision_version": configs.data.get(
+                "augmentation_decision_version",
+                AUGMENTATION_DECISION_VERSION,
+            ),
         }
 
     data_config = configs.data
@@ -1210,18 +2500,56 @@ def get_datasets(
         dataset_param["limits"] = data_config.get("limits", -1)
         train_dataset = BaseSingleDataset(**dataset_param)
         train_datasets.append(train_dataset)
-        datapoint_weights.append(
-            get_sample_weights(
-                **data_config[train_name]["sampler_configs"],
-                indices_df=train_dataset.indices_list,
+        if train_dataset.runtime_distillation_index is not None:
+            sampler_type = data_config[train_name]["sampler_configs"].get(
+                "sampler_type"
             )
+            if sampler_type != "clustered":
+                raise ValueError(
+                    f"{train_name} runtime distillation requires "
+                    "sampler_type='clustered'"
+                )
+            datapoint_weights.append(
+                {
+                    "kind": "clustered",
+                    "source": train_dataset.runtime_distillation_index,
+                }
+            )
+        else:
+            datapoint_weights.append(
+                get_sample_weights(
+                    **data_config[train_name]["sampler_configs"],
+                    indices_df=train_dataset.indices_list,
+                )
+            )
+
+    if any(
+        isinstance(spec, dict) and spec.get("kind") == "clustered"
+        for spec in datapoint_weights
+    ):
+        child_sampling_specs = [
+            spec
+            if isinstance(spec, dict) and "kind" in spec
+            else {"kind": "weighted", "weights": spec}
+            for spec in datapoint_weights
+        ]
+        train_dataset = HierarchicalWeightedMultiDataset(
+            datasets=train_datasets,
+            dataset_names=list(data_config.train_sets),
+            child_sampling_specs=child_sampling_specs,
+            dataset_sample_weights=list(
+                data_config.train_sampler.train_sample_weights
+            ),
         )
-    train_dataset = WeightedMultiDataset(
-        datasets=train_datasets,
-        dataset_names=data_config.train_sets,
-        datapoint_weights=datapoint_weights,
-        dataset_sample_weights=data_config.train_sampler.train_sample_weights,
-    )
+    else:
+        train_dataset = WeightedMultiDataset(
+            datasets=train_datasets,
+            dataset_names=data_config.train_sets,
+            datapoint_weights=datapoint_weights,
+            dataset_sample_weights=(
+                data_config.train_sampler.train_sample_weights
+            ),
+        )
 
     test_datasets = {}
     test_sets = data_config.test_sets

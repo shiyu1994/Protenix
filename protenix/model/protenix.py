@@ -15,7 +15,7 @@
 import copy
 import random
 import time
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import numpy as np
 import torch
@@ -342,6 +342,45 @@ class Protenix(nn.Module):
             sample_diffusion
         )(**_configs, **kwargs)
 
+    def _prepare_diffusion_shared_cache(
+        self,
+        input_feature_dict: dict[str, Any],
+        z_trunk: torch.Tensor,
+        use_conditioning: bool = True,
+    ) -> dict[str, torch.Tensor]:
+        """Prepare sample-independent diffusion inputs once for chunk reuse.
+
+        A dropped training pass must build ``pair_z`` from a zeroed trunk, just
+        like the uncached DiffusionConditioning path. The mini-rollout always
+        requests a separate full-conditioning cache. When training keeps
+        conditioning, that same full cache is reused without recomputation.
+        """
+        pair_z = autocasting_disable_decorator(
+            self.configs.skip_amp.sample_diffusion
+        )(self.diffusion_module.diffusion_conditioning.prepare_cache)(
+            input_feature_dict["relp"],
+            z_trunk,
+            False,
+            use_conditioning=use_conditioning,
+        )
+        p_lm, c_l = autocasting_disable_decorator(
+            self.configs.skip_amp.sample_diffusion
+        )(self.diffusion_module.atom_attention_encoder.prepare_cache)(
+            ref_pos=input_feature_dict["ref_pos"],
+            ref_charge=input_feature_dict["ref_charge"],
+            ref_mask=input_feature_dict["ref_mask"],
+            ref_element=input_feature_dict["ref_element"],
+            ref_atom_name_chars=input_feature_dict["ref_atom_name_chars"],
+            atom_to_token_idx=input_feature_dict["atom_to_token_idx"],
+            d_lm=input_feature_dict["d_lm"],
+            v_lm=input_feature_dict["v_lm"],
+            pad_info=input_feature_dict["pad_info"],
+            r_l=True,
+            z=pair_z,
+            inplace_safe=False,
+        )
+        return {"pair_z": pair_z, "p_lm": p_lm, "c_l": c_l}
+
     def run_confidence_head(self, *args: Any, **kwargs: Any) -> Any:
         """
         Runs the confidence head with optional automatic mixed precision (AMP) disabled.
@@ -534,31 +573,14 @@ class Protenix(nn.Module):
         )
         cache = dict()
         if self.enable_diffusion_shared_vars_cache:
-            # line 1-5 of algorithm 21 calculate z in diffusion conditioning
-            cache["pair_z"] = autocasting_disable_decorator(
-                self.configs.skip_amp.sample_diffusion
-            )(self.diffusion_module.diffusion_conditioning.prepare_cache)(
-                input_feature_dict["relp"], z, False
-            )
-            cache["p_lm/c_l"] = autocasting_disable_decorator(
-                self.configs.skip_amp.sample_diffusion
-            )(self.diffusion_module.atom_attention_encoder.prepare_cache)(
-                ref_pos=input_feature_dict["ref_pos"],
-                ref_charge=input_feature_dict["ref_charge"],
-                ref_mask=input_feature_dict["ref_mask"],
-                ref_element=input_feature_dict["ref_element"],
-                ref_atom_name_chars=input_feature_dict["ref_atom_name_chars"],
-                atom_to_token_idx=input_feature_dict["atom_to_token_idx"],
-                d_lm=input_feature_dict["d_lm"],
-                v_lm=input_feature_dict["v_lm"],
-                pad_info=input_feature_dict["pad_info"],
-                r_l=True,
-                z=cache["pair_z"],
-                inplace_safe=False,
+            cache = self._prepare_diffusion_shared_cache(
+                input_feature_dict=input_feature_dict,
+                z_trunk=z,
             )
         else:
             cache["pair_z"] = None
-            cache["p_lm/c_l"] = [None, None]
+            cache["p_lm"] = None
+            cache["c_l"] = None
         pred_dict["coordinate"] = self.sample_diffusion(
             denoise_net=self.diffusion_module,
             input_feature_dict=input_feature_dict,
@@ -566,8 +588,8 @@ class Protenix(nn.Module):
             s_trunk=s,
             z_trunk=None if cache["pair_z"] is not None else z,
             pair_z=cache["pair_z"],
-            p_lm=cache["p_lm/c_l"][0],
-            c_l=cache["p_lm/c_l"][1],
+            p_lm=cache["p_lm"],
+            c_l=cache["c_l"],
             N_sample=N_sample,
             noise_schedule=noise_schedule,
             inplace_safe=inplace_safe,
@@ -663,6 +685,7 @@ class Protenix(nn.Module):
         symmetric_permutation: SymmetricPermutation,
         inplace_safe: bool = False,
         chunk_size: Optional[int] = None,
+        memory_phase_callback: Optional[Callable[[str], None]] = None,
     ) -> tuple[dict[str, torch.Tensor], dict[str, Any], dict[str, Any]]:
         """
         Main training loop for the Alphafold3 model.
@@ -687,36 +710,24 @@ class Protenix(nn.Module):
             inplace_safe=inplace_safe,
             chunk_size=chunk_size,
         )
+        if memory_phase_callback is not None:
+            memory_phase_callback("diffusion_shared_cache")
 
         log_dict = {}
         pred_dict = {}
 
         cache = dict()
         if self.enable_diffusion_shared_vars_cache:
-            cache["pair_z"] = autocasting_disable_decorator(
-                self.configs.skip_amp.sample_diffusion
-            )(self.diffusion_module.diffusion_conditioning.prepare_cache)(
-                input_feature_dict["relp"], z, False
-            )
-            cache["p_lm/c_l"] = autocasting_disable_decorator(
-                self.configs.skip_amp.sample_diffusion
-            )(self.diffusion_module.atom_attention_encoder.prepare_cache)(
-                ref_pos=input_feature_dict["ref_pos"],
-                ref_charge=input_feature_dict["ref_charge"],
-                ref_mask=input_feature_dict["ref_mask"],
-                ref_element=input_feature_dict["ref_element"],
-                ref_atom_name_chars=input_feature_dict["ref_atom_name_chars"],
-                atom_to_token_idx=input_feature_dict["atom_to_token_idx"],
-                d_lm=input_feature_dict["d_lm"],
-                v_lm=input_feature_dict["v_lm"],
-                pad_info=input_feature_dict["pad_info"],
-                r_l=True,
-                z=cache["pair_z"],
-                inplace_safe=False,
+            cache = self._prepare_diffusion_shared_cache(
+                input_feature_dict=input_feature_dict,
+                z_trunk=z,
             )
         else:
             cache["pair_z"] = None
-            cache["p_lm/c_l"] = [None, None]
+            cache["p_lm"] = None
+            cache["c_l"] = None
+        if memory_phase_callback is not None:
+            memory_phase_callback("mini_rollout")
         # Mini-rollout: used for confidence and label permutation
         with torch.no_grad():
             # [..., 1, N_atom, 3]
@@ -733,14 +744,10 @@ class Protenix(nn.Module):
                 z_trunk=None if cache["pair_z"] is not None else z.detach(),
                 pair_z=None if cache["pair_z"] is None else cache["pair_z"].detach(),
                 p_lm=(
-                    None
-                    if cache["p_lm/c_l"][0] is None
-                    else cache["p_lm/c_l"][0].detach()
+                    None if cache["p_lm"] is None else cache["p_lm"].detach()
                 ),
                 c_l=(
-                    None
-                    if cache["p_lm/c_l"][1] is None
-                    else cache["p_lm/c_l"][1].detach()
+                    None if cache["c_l"] is None else cache["c_l"].detach()
                 ),
                 N_sample=N_sample_mini_rollout,
                 noise_schedule=self.inference_noise_scheduler(
@@ -765,6 +772,9 @@ class Protenix(nn.Module):
                 label_full_dict,
             )
             log_dict.update(perm_log_dict)
+
+        if memory_phase_callback is not None:
+            memory_phase_callback("confidence")
 
         # Confidence: use mini-rollout prediction, and detach token embeddings
         drop_embedding = (
@@ -796,6 +806,9 @@ class Protenix(nn.Module):
             # Skip diffusion loss and distogram loss. Return now.
             return pred_dict, label_dict, log_dict
 
+        if memory_phase_callback is not None:
+            memory_phase_callback("diffusion_train")
+
         # Denoising: use permuted coords to generate noisy samples and perform denoising
         # x_denoised: [..., N_sample, N_atom, 3]
         # x_noise_level: [..., N_sample]
@@ -803,6 +816,15 @@ class Protenix(nn.Module):
         drop_conditioning = (
             random.random() < self.configs.model.condition_embedding_drop_rate
         )
+        if self.enable_diffusion_shared_vars_cache and drop_conditioning:
+            # The full cache above belongs to the always-conditioned
+            # mini-rollout. A dropped training pass needs one zero-trunk cache,
+            # shared by every diffusion batch chunk.
+            cache = self._prepare_diffusion_shared_cache(
+                input_feature_dict=input_feature_dict,
+                z_trunk=z,
+                use_conditioning=False,
+            )
         _, x_denoised, x_noise_level = autocasting_disable_decorator(
             self.configs.skip_amp.sample_diffusion_training
         )(sample_diffusion_training)(
@@ -814,8 +836,8 @@ class Protenix(nn.Module):
             s_trunk=s,
             z_trunk=None if cache["pair_z"] is not None else z,
             pair_z=cache["pair_z"],
-            p_lm=cache["p_lm/c_l"][0],
-            c_l=cache["p_lm/c_l"][1],
+            p_lm=cache["p_lm"],
+            c_l=cache["c_l"],
             N_sample=N_sample,
             diffusion_chunk_size=self.configs.diffusion_chunk_size,
             use_conditioning=not drop_conditioning,
@@ -857,6 +879,7 @@ class Protenix(nn.Module):
         symmetric_permutation: SymmetricPermutation = None,
         disable_inplace: bool = False,
         mc_dropout_apply_rate: float = 0.4,
+        memory_phase_callback: Optional[Callable[[str], None]] = None,
     ) -> tuple[dict[str, torch.Tensor], dict[str, Any], dict[str, Any]]:
         """
         Forward pass of the Alphafold3 model.
@@ -884,6 +907,8 @@ class Protenix(nn.Module):
         input_feature_dict = update_input_feature_dict(input_feature_dict)
 
         if mode == "train":
+            if memory_phase_callback is not None:
+                memory_phase_callback("trunk")
             nc_rng = np.random.RandomState(current_step)
             N_cycle = nc_rng.randint(1, self.N_cycle + 1)
             assert self.training
@@ -898,6 +923,7 @@ class Protenix(nn.Module):
                 symmetric_permutation=symmetric_permutation,
                 inplace_safe=inplace_safe,
                 chunk_size=None,
+                memory_phase_callback=memory_phase_callback,
             )
             log_dict["N_cycle"] = N_cycle
         elif mode == "inference":

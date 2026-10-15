@@ -1044,6 +1044,8 @@ def get_data_shape_dict(
         "atom_to_tokatom_idx": (num_atom,),  # after crop
         "pae_rep_atom_mask": (num_atom,),  # same as "pae_rep_atom_mask" in label_dict
         "is_distillation": (1,),
+        "disable_non_protein_diffusion_weights": (1,),
+        "min_diffusion_supervised_tokens": (1,),
     }
 
     # Label

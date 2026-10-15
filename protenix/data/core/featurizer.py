@@ -26,6 +26,74 @@ from protenix.data.utils import get_atom_level_token_mask, get_ligand_polymer_bo
 from protenix.utils.geometry import angle_3p, random_transform
 
 
+def _canonicalize_cropped_residue_permutations(
+    atom_res_perm: np.ndarray,
+) -> np.ndarray:
+    """Restrict full-residue permutations to a cropped atom subset.
+
+    ``res_perm`` values are local indices in the original, complete residue.
+    Atom-level crops of ligands and non-standard residues can retain only a
+    subset of those atoms.  Keep only permutation columns whose image is
+    exactly that retained subset, then reindex the retained atoms to the
+    cropped residue's ``0..N-1`` coordinate system.
+
+    The first column is the identity permutation and therefore also records
+    each retained atom's original local index.
+    """
+    if atom_res_perm.ndim != 2 or atom_res_perm.shape[1] < 1:
+        raise ValueError(
+            "residue atom permutations must have shape [N_atom, N_perm] "
+            "with at least one permutation"
+        )
+
+    retained_full_indices = atom_res_perm[:, 0]
+    n_retained_atoms = atom_res_perm.shape[0]
+    if np.unique(retained_full_indices).size != n_retained_atoms:
+        raise ValueError(
+            "identity atom permutation must contain one distinct original "
+            "index per retained atom"
+        )
+
+    # Standard complete residues already use cropped-local indices.  Preserve
+    # their exact output and avoid extra Python work on the common path.
+    expected_local_indices = np.arange(n_retained_atoms, dtype=atom_res_perm.dtype)
+    if np.array_equal(retained_full_indices, expected_local_indices):
+        sorted_columns = np.sort(atom_res_perm, axis=0)
+        expected_columns = np.broadcast_to(
+            expected_local_indices[:, None], atom_res_perm.shape
+        )
+        if np.array_equal(sorted_columns, expected_columns):
+            return atom_res_perm
+
+    retained_index_set = set(retained_full_indices.tolist())
+    closed_column_indices = []
+    for column_index in range(atom_res_perm.shape[1]):
+        column_values = atom_res_perm[:, column_index]
+        if (
+            np.unique(column_values).size == n_retained_atoms
+            and set(column_values.tolist()) == retained_index_set
+        ):
+            closed_column_indices.append(column_index)
+
+    # The identity column maps the retained subset to itself, so a valid input
+    # must always leave at least one closed permutation.
+    if not closed_column_indices:
+        raise ValueError(
+            "cropped residue has no atom permutation closed on its retained atoms"
+        )
+
+    closed_permutations = atom_res_perm[:, closed_column_indices]
+    cropped_index_by_full_index = {
+        full_index: cropped_index
+        for cropped_index, full_index in enumerate(retained_full_indices.tolist())
+    }
+    remapped_permutations = np.empty_like(closed_permutations)
+    for full_index, cropped_index in cropped_index_by_full_index.items():
+        remapped_permutations[closed_permutations == full_index] = cropped_index
+
+    return remapped_permutations
+
+
 class Featurizer(object):
     """
     Args:
@@ -162,14 +230,11 @@ class Featurizer(object):
             # For DNA and RNA
             abc_atom_name = [r"C1'", r"C3'", r"C4'"]
 
-        idx_in_atom_indices = []
-        for i in abc_atom_name:
-            if centre_atom.mol_type == "protein" and "N" not in token.atom_names:
-                return 0, [-1, -1, -1]
-            elif centre_atom.mol_type != "protein" and "C1'" not in token.atom_names:
-                return 0, [-1, -1, -1]
-            idx_in_atom_indices.append(token.atom_names.index(i))
-        # Protein/DNA/RNA always has frame
+        # Observed-only structures can omit any backbone atom. Retain the
+        # residue, but mask its frame when the complete triplet is unavailable.
+        if any(name not in token.atom_names for name in abc_atom_name):
+            return 0, [-1, -1, -1]
+        idx_in_atom_indices = [token.atom_names.index(name) for name in abc_atom_name]
         has_frame = 1
         frame_atom_index = [token.atom_indices[i] for i in idx_in_atom_indices]
         return has_frame, frame_atom_index
@@ -765,29 +830,34 @@ class Featurizer(object):
 
             if np.sum(res_fixed_atom_mask) == 0:
                 # If all atoms in the residue are not fixed, e.g. ions
-                fixed_atom_perm_list.extend(atom_res_perm.tolist())
-                continue
+                fixed_atom_res_perm = atom_res_perm
+            else:
+                # Create a [N_res_atoms, N_res_perm] template of indices
+                n_res_atoms, n_perm = atom_res_perm.shape
+                indices_template = (
+                    atom_res_perm[:, 0]
+                    .reshape(n_res_atoms, 1)
+                    .repeat(n_perm, axis=1)
+                )
 
-            # Create a [N_res_atoms, N_res_perm] template of indices
-            n_res_atoms, n_perm = atom_res_perm.shape
-            indices_template = (
-                atom_res_perm[:, 0].reshape(n_res_atoms, 1).repeat(n_perm, axis=1)
+                # Identify columns where all fixed atoms remain unchanged.
+                fixed_atom_perm = atom_res_perm[
+                    res_fixed_atom_mask
+                ]  # [N_fixed_res_atoms, N_res_perm]
+                fixed_indices_template = indices_template[
+                    res_fixed_atom_mask
+                ]  # [N_fixed_res_atoms, N_res_perm]
+                unchanged_columns_mask = np.all(
+                    fixed_atom_perm == fixed_indices_template, axis=0
+                )
+
+                # Remove the columns related to the position changes of fixed atoms.
+                fixed_atom_res_perm = atom_res_perm[:, unchanged_columns_mask]
+
+            cropped_atom_res_perm = _canonicalize_cropped_residue_permutations(
+                fixed_atom_res_perm
             )
-
-            # Identify the column where the positions of the fixed atoms remain unchanged
-            fixed_atom_perm = atom_res_perm[
-                res_fixed_atom_mask
-            ]  # [N_fixed_res_atoms, N_res_perm]
-            fixed_indices_template = indices_template[
-                res_fixed_atom_mask
-            ]  # [N_fixed_res_atoms, N_res_perm]
-            unchanged_columns_mask = np.all(
-                fixed_atom_perm == fixed_indices_template, axis=0
-            )
-
-            # Remove the columns related to the position changes of fixed atoms.
-            fixed_atom_res_perm = atom_res_perm[:, unchanged_columns_mask]
-            fixed_atom_perm_list.extend(fixed_atom_res_perm.tolist())
+            fixed_atom_perm_list.extend(cropped_atom_res_perm.tolist())
         return fixed_atom_perm_list
 
     @staticmethod

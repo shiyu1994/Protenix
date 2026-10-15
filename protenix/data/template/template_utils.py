@@ -87,6 +87,39 @@ _POLYMER_FEATURES: Final[Mapping[str, Union[np.float64, np.int32, object]]] = {
 }
 
 
+def _sample_template_count(
+    *,
+    num_candidates: int,
+    max_hits: Optional[int],
+    minimum_template_count: int,
+) -> int:
+    """Choose how many template candidates to process.
+
+    ``minimum_template_count=0`` preserves the historical training behavior,
+    including the possibility of selecting no template.  Callers making an
+    explicit ``use_real_template`` decision can request a minimum of one.  The
+    minimum is necessarily clamped when fewer candidates exist.
+    """
+    if isinstance(minimum_template_count, bool) or not isinstance(
+        minimum_template_count, (int, np.integer)
+    ):
+        raise TypeError("minimum_template_count must be an integer")
+    minimum_template_count = int(minimum_template_count)
+    if not 0 <= minimum_template_count <= 4:
+        raise ValueError("minimum_template_count must be in [0, 4]")
+    if num_candidates < 0:
+        raise ValueError("num_candidates must be non-negative")
+
+    if max_hits is not None:
+        return max(0, int(max_hits))
+
+    candidate_limit = min(num_candidates, 20)
+    if candidate_limit == 0:
+        return 0
+    sample_lower_bound = min(minimum_template_count, candidate_limit)
+    return min(4, random.randint(sample_lower_bound, candidate_limit))
+
+
 @dataclasses.dataclass(frozen=True)
 class DistogramFeaturesConfig:
     # The left edge of the first bin.
@@ -859,6 +892,8 @@ class TemplateHitFeaturizer:
         query_sequence: str,
         hits: Sequence[TemplateHit],
         max_template_date: Optional[Union[str, datetime]] = None,
+        *,
+        minimum_template_count: int = 0,
     ) -> Tuple[TemplateSearchResult, Dict[str, float]]:
         """
         Processes hits to generate template features.
@@ -868,6 +903,9 @@ class TemplateHitFeaturizer:
             query_sequence: The query sequence.
             hits: A sequence of TemplateHit objects.
             max_template_date: Optional cutoff date to override the default.
+            minimum_template_count: Minimum number of candidates to process when
+                candidates exist. Zero preserves the historical training
+                behavior; one is used by an explicit real-template occurrence.
 
         Returns:
             A tuple of (TemplateSearchResult, timing_dict).
@@ -916,11 +954,13 @@ class TemplateHitFeaturizer:
         if self._max_template_candidates_num:
             indices = indices[: self._max_template_candidates_num]
 
-        # Determine number of templates to collect.
-        max_to_collect = (
-            self._max_hits
-            if self._max_hits is not None
-            else min(4, random.randint(0, min(len(indices), 20)))
+        # Determine number of templates to collect.  Explicit real-template
+        # occurrences request a lower bound of one while legacy callers retain
+        # the historical zero-inclusive sampling distribution.
+        max_to_collect = _sample_template_count(
+            num_candidates=len(indices),
+            max_hits=self._max_hits,
+            minimum_template_count=minimum_template_count,
         )
 
         features, final_hits = [], []

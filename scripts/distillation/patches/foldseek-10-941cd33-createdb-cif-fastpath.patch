@@ -1,0 +1,19 @@
+diff --git a/src/strucclustutils/structcreatedb.cpp b/src/strucclustutils/structcreatedb.cpp
+index e0260b1..bcb36ba 100644
+--- a/src/strucclustutils/structcreatedb.cpp
++++ b/src/strucclustutils/structcreatedb.cpp
+@@ -833,6 +833,14 @@ int structcreatedb(int argc, const char **argv, const Command& command) {
+             gcsPaths.push_back(par.filenames[i]);
+         }
+ #endif
++        else if (Util::endsWith(".pdb", par.filenames[i])
++                || Util::endsWith(".pdb.gz", par.filenames[i])
++                || Util::endsWith(".cif", par.filenames[i])
++                || Util::endsWith(".cif.gz", par.filenames[i])
++                || Util::endsWith(".mmcif", par.filenames[i])
++                || Util::endsWith(".mmcif.gz", par.filenames[i])) {
++            looseFiles.push_back(par.filenames[i]);
++        }
+         else if (FileUtil::fileExists((par.filenames[i] + ".dbtype").c_str())) {
+             dbs.push_back(par.filenames[i]);
+         } else {

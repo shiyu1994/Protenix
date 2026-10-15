@@ -68,6 +68,14 @@ from protenix.data.constants import (
 from protenix.data.core import ccd
 from protenix.data.core.ccd import get_ccd_ref_info
 from protenix.data.core.filter import Filter
+from protenix.data.core.predicted_protein_cif_reader import (
+    read_predicted_protein_atom_array_fast,
+)
+from protenix.data.core.predicted_protein_fast_path import (
+    FastPathNotApplicable,
+    complete_predicted_protein_atom_array,
+    prepare_predicted_protein_fast_path,
+)
 from protenix.data.tools.logger import MMCIFStatsLogger
 from protenix.data.tools.rewrite_biotite import _parse_inter_residue_bonds, concatenate
 from protenix.data.utils import (
@@ -79,6 +87,22 @@ from protenix.data.utils import (
 from protenix.utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+_TOKATOM_SEPARATOR = "\x1f"
+_TOKATOM_ITEMS = sorted(
+    (
+        f"{res_name}{_TOKATOM_SEPARATOR}{atom_name}",
+        atom_index,
+    )
+    for res_name, atom_names in RES_ATOMS_DICT.items()
+    for atom_name, atom_index in atom_names.items()
+)
+_TOKATOM_KEYS = np.asarray([item[0] for item in _TOKATOM_ITEMS])
+_TOKATOM_VALUES = np.asarray(
+    [item[1] for item in _TOKATOM_ITEMS],
+    dtype=int,
+)
+_TOKATOM_RESIDUE_NAMES = np.asarray(sorted(RES_ATOMS_DICT))
 
 # PDBX_COVALENT_TYPES was removed in biotite commit
 # https://github.com/biotite-dev/biotite/commit/5f584ac3d73650ea7ec657df185f08ff55e8037f
@@ -2570,7 +2594,10 @@ class RecentPDB_MMCIFParser(MMCIFParser):
 
 class DistillationMMCIFParser(MMCIFParser):
     def get_structure_dict(
-        self, add_missing_atom: bool = True, ccd_mols: dict[str, Chem.Mol] = None
+        self,
+        add_missing_atom: bool = True,
+        ccd_mols: dict[str, Chem.Mol] = None,
+        predicted_protein_fast_path: str = "off",
     ) -> dict[str, Any]:
         """
         Get an AtomArray from a CIF file of distillation data.
@@ -2578,12 +2605,49 @@ class DistillationMMCIFParser(MMCIFParser):
         Args:
             add_missing_atom (bool, optional): Whether to add missing atoms. Defaults to True.
             ccd_mols (dict[str, Chem.Mol], optional): CCD code to mol dict. Defaults to None.
+            predicted_protein_fast_path (str, optional): ``"off"`` keeps the
+                generic implementation, ``"auto"`` falls back when the input
+                is ineligible, and ``"require"`` requires both the strict
+                Gemmi reader and vectorized atom-completion path.
 
         Returns:
             Dict[str, Any]: a dict of asymmetric unit structure info.
         """
+        fast_path_modes = {"off", "auto", "require"}
+        if predicted_protein_fast_path not in fast_path_modes:
+            raise ValueError(
+                "predicted_protein_fast_path must be one of "
+                f"{sorted(fast_path_modes)}, got {predicted_protein_fast_path!r}"
+            )
+        if not add_missing_atom and predicted_protein_fast_path != "off":
+            raise ValueError(
+                "predicted_protein_fast_path requires add_missing_atom=True"
+            )
+        fast_path_info = {
+            "mode": predicted_protein_fast_path,
+            "used": False,
+            "fallback_reason": None,
+            "cif_reader_used": False,
+            "cif_reader_fallback_reason": None,
+        }
+
         # created AtomArray of first model from mmcif atom_site (Asymmetric Unit)
-        atom_array = self.get_structure()
+        if predicted_protein_fast_path == "off":
+            atom_array = self.get_structure()
+        else:
+            try:
+                if self.mmcif_file is None:
+                    raise FastPathNotApplicable("unsupported_cif_source")
+                atom_array = read_predicted_protein_atom_array_fast(
+                    self.mmcif_file
+                )
+            except FastPathNotApplicable as exc:
+                fast_path_info["cif_reader_fallback_reason"] = exc.reason
+                if predicted_protein_fast_path == "require":
+                    raise
+                atom_array = self.get_structure()
+            else:
+                fast_path_info["cif_reader_used"] = True
 
         structure_dict = {
             "pdb_id": self.pdb_id,
@@ -2596,6 +2660,9 @@ class DistillationMMCIFParser(MMCIFParser):
         }
 
         if atom_array is None:
+            if predicted_protein_fast_path != "off":
+                fast_path_info["fallback_reason"] = "empty_atom_array"
+                structure_dict["predicted_protein_fast_path"] = fast_path_info
             return structure_dict
 
         # convert MSE to MET to consistent with MMCIFParser.get_poly_res_names()
@@ -2611,20 +2678,43 @@ class DistillationMMCIFParser(MMCIFParser):
             Filter.remove_element_X,
         ]
 
-        if add_missing_atom:
-            # add UNK
-            pipeline_functions.append(self.add_missing_atoms_and_residues)
-
         for func in pipeline_functions:
             atom_array = func(atom_array)
             if len(atom_array) == 0:
                 # no atoms left
+                if predicted_protein_fast_path != "off":
+                    fast_path_info["fallback_reason"] = "empty_atom_array"
+                    structure_dict["predicted_protein_fast_path"] = fast_path_info
                 return structure_dict
 
-        if not add_missing_atom:
+        if add_missing_atom:
+            if predicted_protein_fast_path == "off":
+                atom_array = self.add_missing_atoms_and_residues(atom_array)
+            else:
+                try:
+                    layout = prepare_predicted_protein_fast_path(
+                        atom_array,
+                        structure_dict["sequences"],
+                        self.entity_poly_type,
+                    )
+                except FastPathNotApplicable as exc:
+                    fast_path_info["fallback_reason"] = exc.reason
+                    if predicted_protein_fast_path == "require":
+                        raise
+                    atom_array = self.add_missing_atoms_and_residues(atom_array)
+                else:
+                    atom_array = complete_predicted_protein_atom_array(
+                        atom_array,
+                        layout,
+                    )
+                    fast_path_info["used"] = True
+        else:
             atom_array.set_annotation(
                 "is_resolved", np.ones(len(atom_array)).astype(bool)
             )
+
+        if predicted_protein_fast_path != "off":
+            structure_dict["predicted_protein_fast_path"] = fast_path_info
 
         atom_array = AddAtomArrayAnnot.add_token_mol_type(
             atom_array, self.entity_poly_type
@@ -2699,7 +2789,7 @@ class AddAtomArrayAnnot(object):
         starts = struc.get_residue_starts(atom_array, add_exclusive_stop=True)
         for start, stop in zip(starts[:-1], starts[1:]):
             entity_id = atom_array.label_entity_id[start]
-            if entity_id not in sequences:
+            if entity_id not in sequences or sequences[entity_id] == "non-polymer":
                 # non-poly is ligand
                 mol_types[start:stop] = "ligand"
                 continue
@@ -3155,16 +3245,36 @@ class AddAtomArrayAnnot(object):
         Returns:
         AtomArray: The AtomArray object with the 'tokatom_idx' annotation added.
         """
-        # pre-defined atom name order for tokatom_idx
-        tokatom_idx_list = []
-        for atom in atom_array:
-            atom_name_position = RES_ATOMS_DICT.get(atom.res_name, None)
-            if atom.mol_type == "ligand" or atom_name_position is None:
-                tokatom_idx = 0
-            else:
-                tokatom_idx = atom_name_position[atom.atom_name]
-            tokatom_idx_list.append(tokatom_idx)
-        atom_array.set_annotation("tokatom_idx", tokatom_idx_list)
+        tokatom_idx = np.zeros(len(atom_array), dtype=int)
+        standard_mask = (atom_array.mol_type != "ligand") & np.isin(
+            atom_array.res_name,
+            _TOKATOM_RESIDUE_NAMES,
+        )
+        if np.any(standard_mask):
+            standard_indices = np.flatnonzero(standard_mask)
+            pair_keys = np.char.add(
+                np.char.add(
+                    atom_array.res_name[standard_indices],
+                    _TOKATOM_SEPARATOR,
+                ),
+                atom_array.atom_name[standard_indices],
+            )
+            key_indices = np.searchsorted(_TOKATOM_KEYS, pair_keys)
+            safe_key_indices = np.minimum(
+                key_indices,
+                len(_TOKATOM_KEYS) - 1,
+            )
+            matched = (key_indices < len(_TOKATOM_KEYS)) & (
+                _TOKATOM_KEYS[safe_key_indices] == pair_keys
+            )
+            if not np.all(matched):
+                first_missing = standard_indices[
+                    np.flatnonzero(~matched)[0]
+                ]
+                raise KeyError(atom_array.atom_name[first_missing])
+            tokatom_idx[standard_indices] = _TOKATOM_VALUES[key_indices]
+
+        atom_array.set_annotation("tokatom_idx", tokatom_idx)
         return atom_array
 
     @staticmethod
@@ -3346,20 +3456,38 @@ class AddAtomArrayAnnot(object):
 
         starts = get_residue_starts(atom_array, add_exclusive_stop=True)
         res_perm = []
+        # Keep this cache local because the permutation source depends on
+        # ``ccd_mols``. Atom order is part of the key because output indices
+        # are relative to the atoms as they appear in this residue.
+        signature_to_res_perm = {}
         for start, stop in zip(starts[:-1], starts[1:]):
+            res_name = atom_array.res_name[start]
+            atom_names = atom_array.atom_name[start:stop]
+            residue_signature = (res_name, tuple(atom_names))
+            cached_res_perm = signature_to_res_perm.get(residue_signature)
+            if cached_res_perm is not None:
+                res_perm.extend([list(row) for row in cached_res_perm])
+                continue
+
             curr_res_atom_idx = list(range(stop - start))
 
             res_dict = get_ccd_ref_info(
-                ccd_code=atom_array.res_name[start:stop][0],
+                ccd_code=res_name,
                 ccd_mols=ccd_mols,
             )
             if not res_dict:
-                res_perm.extend([[i] for i in curr_res_atom_idx])
+                residue_res_perm = tuple(
+                    (i,) for i in curr_res_atom_idx
+                )
+                signature_to_res_perm[residue_signature] = (
+                    residue_res_perm
+                )
+                res_perm.extend([list(row) for row in residue_res_perm])
                 continue
 
             perm_array = res_dict["perm"]  # [N_atoms, N_perm]
             perm_atom_idx_in_res_order = [
-                res_dict["atom_map"][i] for i in atom_array.atom_name[start:stop]
+                res_dict["atom_map"][i] for i in atom_names
             ]
             perm_idx_to_present_atom_idx = dict(
                 zip(perm_atom_idx_in_res_order, curr_res_atom_idx)
@@ -3389,7 +3517,11 @@ class AddAtomArrayAnnot(object):
                 f"does not match the number of permutations ({new_perm_array.shape[0]}). "
                 "May be due to ligand only."
             )
-            res_perm.extend(new_perm_array.tolist())
+            residue_res_perm = tuple(
+                tuple(row) for row in new_perm_array.tolist()
+            )
+            signature_to_res_perm[residue_signature] = residue_res_perm
+            res_perm.extend([list(row) for row in residue_res_perm])
         return res_perm
 
     @staticmethod

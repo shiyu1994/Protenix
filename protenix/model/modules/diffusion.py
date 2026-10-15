@@ -47,6 +47,8 @@ class DiffusionConditioning(nn.Module):
         c_s: int = 384,
         c_s_inputs: int = 449,
         c_noise_embedding: int = 256,
+        train_pair_transition_chunk_size: Optional[int] = None,
+        train_pair_transition_checkpoint_chunks: bool = False,
     ) -> None:
         super(DiffusionConditioning, self).__init__()
         self.sigma_data = sigma_data
@@ -60,8 +62,18 @@ class DiffusionConditioning(nn.Module):
             in_features=2 * self.c_z, out_features=self.c_z, precision=torch.float32
         )
         # Line3-Line5:
-        self.transition_z1 = Transition(c_in=self.c_z, n=2)
-        self.transition_z2 = Transition(c_in=self.c_z, n=2)
+        self.transition_z1 = Transition(
+            c_in=self.c_z,
+            n=2,
+            train_chunk_size=train_pair_transition_chunk_size,
+            train_checkpoint_chunks=train_pair_transition_checkpoint_chunks,
+        )
+        self.transition_z2 = Transition(
+            c_in=self.c_z,
+            n=2,
+            train_chunk_size=train_pair_transition_chunk_size,
+            train_checkpoint_chunks=train_pair_transition_checkpoint_chunks,
+        )
 
         # Line6-Line7
         self.layernorm_s = LayerNorm(self.c_s + self.c_s_inputs, create_offset=False)
@@ -88,7 +100,13 @@ class DiffusionConditioning(nn.Module):
         relp_feature: torch.Tensor,
         z_trunk: torch.Tensor,
         inplace_safe: bool = False,
+        use_conditioning: bool = True,
     ) -> torch.Tensor:
+        if not use_conditioning:
+            if inplace_safe:
+                z_trunk *= 0
+            else:
+                z_trunk = 0 * z_trunk
         # Pair conditioning
         pair_z = torch.cat(
             tensors=[
@@ -139,15 +157,18 @@ class DiffusionConditioning(nn.Module):
                 - s (torch.Tensor): [..., N_sample, N_tokens, c_s]
                 - z (torch.Tensor): [..., N_tokens, N_tokens, c_z]
         """
+        if not use_conditioning:
+            if inplace_safe:
+                s_trunk *= 0
+            else:
+                s_trunk = 0 * s_trunk
         if pair_z is None:
-            if not use_conditioning:
-                if inplace_safe:
-                    s_trunk *= 0
-                    z_trunk *= 0
-                else:
-                    s_trunk = 0 * s_trunk
-                    z_trunk = 0 * z_trunk
-            pair_z = self.prepare_cache(relp_feature, z_trunk, inplace_safe)
+            pair_z = self.prepare_cache(
+                relp_feature,
+                z_trunk,
+                inplace_safe,
+                use_conditioning=use_conditioning,
+            )
         else:
             # Pair conditioning
             if inplace_safe:
@@ -270,6 +291,8 @@ class DiffusionModule(nn.Module):
         drop_path_rate: float = 0.0,
         blocks_per_ckpt: Optional[int] = None,
         use_fine_grained_checkpoint: bool = False,
+        train_pair_transition_chunk_size: Optional[int] = None,
+        train_pair_transition_checkpoint_chunks: bool = False,
     ) -> None:
         super(DiffusionModule, self).__init__()
         self.sigma_data = sigma_data
@@ -285,7 +308,12 @@ class DiffusionModule(nn.Module):
         self.use_fine_grained_checkpoint = use_fine_grained_checkpoint
 
         self.diffusion_conditioning = DiffusionConditioning(
-            sigma_data=self.sigma_data, c_z=c_z, c_s=c_s, c_s_inputs=c_s_inputs
+            sigma_data=self.sigma_data,
+            c_z=c_z,
+            c_s=c_s,
+            c_s_inputs=c_s_inputs,
+            train_pair_transition_chunk_size=train_pair_transition_chunk_size,
+            train_pair_transition_checkpoint_chunks=train_pair_transition_checkpoint_chunks,
         )
         self.atom_attention_encoder = AtomAttentionEncoder(
             **atom_encoder,

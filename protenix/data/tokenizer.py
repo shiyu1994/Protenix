@@ -117,41 +117,48 @@ class AtomArrayTokenizer(object):
         Returns:
            list : a list of Token object.
         """
+        atom_count = len(self.atom_array)
+        if atom_count == 0:
+            return []
+
+        # ``residue_iter()`` creates an AtomArray slice for every residue and
+        # indexing such a slice creates an Atom object for every atom. Work
+        # directly on the annotation arrays using the same residue boundaries.
+        residue_starts = struc.get_residue_starts(
+            self.atom_array,
+            add_exclusive_stop=True,
+        )
+        atom_names = self.atom_array.atom_name
+        elements = self.atom_array.element
+        residue_names = self.atom_array.res_name[residue_starts[:-1]]
+        molecule_types = self.atom_array.mol_type[residue_starts[:-1]]
+
         tokens = []
-        total_atom_num = 0
-        for res in struc.residue_iter(self.atom_array):
-            atom_num = len(res)
-            first_atom = res[0]
-            res_name = first_atom.res_name
-            mol_type = first_atom.mol_type
+        for start, stop, res_name, mol_type in zip(
+            residue_starts[:-1],
+            residue_starts[1:],
+            residue_names,
+            molecule_types,
+        ):
             res_token = STD_RESIDUES.get(res_name, None)
             if res_token is not None and mol_type != "ligand":
                 # for std residues
                 token = Token(res_token)
-                atom_indices = [
-                    i for i in range(total_atom_num, total_atom_num + atom_num)
-                ]
-                atom_names = [self.atom_array[i].atom_name for i in atom_indices]
-                token.atom_indices = atom_indices
-                token.atom_names = atom_names
+                token.atom_indices = list(range(start, stop))
+                token.atom_names = atom_names[start:stop].tolist()
                 tokens.append(token)
-                total_atom_num += atom_num
             else:
                 # for ligand and non-std residues
-                for atom in res:
-                    atom_elem = atom.element
+                for atom_index in range(start, stop):
+                    atom_elem = elements[atom_index]
                     atom_token = ELEMS.get(atom_elem, None)
                     if atom_token is None:
                         raise ValueError(f"Unknown atom element: {atom_elem}")
                     token = Token(atom_token)
-                    token.atom_indices = [total_atom_num]
-                    token.atom_names = [
-                        self.atom_array[token.atom_indices[0]].atom_name
-                    ]
+                    token.atom_indices = [atom_index]
+                    token.atom_names = [atom_names[atom_index]]
                     tokens.append(token)
-                    total_atom_num += 1
 
-        assert total_atom_num == len(self.atom_array)
         return tokens
 
     def _set_token_annotations(self, token_array: TokenArray) -> TokenArray:

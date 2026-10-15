@@ -12,10 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import itertools
 import os
 import time
+from collections.abc import Mapping
 
 import torch
+
+
+_PERMUTATION_ERROR_SAVE_COUNTER = itertools.count()
 
 
 class Checker:
@@ -107,6 +112,52 @@ class Checker:
         assert torch.allclose(permuted_x.reshape(target_shape), x_permuted)
 
 
+def _snapshot_to_cpu(data):
+    """Create a detached CPU snapshot suitable for diagnostic serialization."""
+    if isinstance(data, torch.Tensor):
+        return data.detach().to(device="cpu", copy=True)
+    if isinstance(data, Mapping):
+        return {key: _snapshot_to_cpu(value) for key, value in data.items()}
+    if isinstance(data, list):
+        return [_snapshot_to_cpu(value) for value in data]
+    if isinstance(data, tuple):
+        return tuple(_snapshot_to_cpu(value) for value in data)
+    return data
+
+
+def _get_global_rank_and_world_size() -> tuple[int, int]:
+    """Return a valid global rank and world size without initializing distributed."""
+    rank = None
+    world_size = None
+    try:
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            rank = int(torch.distributed.get_rank())
+            world_size = int(torch.distributed.get_world_size())
+    except (RuntimeError, ValueError):
+        rank = None
+        world_size = None
+
+    if rank is None or world_size is None:
+        try:
+            rank = int(os.environ.get("RANK", "0"))
+            world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        except ValueError:
+            rank = 0
+            world_size = 1
+
+    if world_size < 1 or rank < 0 or rank >= world_size:
+        return 0, 1
+    return rank, world_size
+
+
+def _rank_case_quota(max_cases: int, rank: int, world_size: int) -> int:
+    """Deterministically partition a global diagnostic budget across ranks."""
+    if max_cases <= 0:
+        return 0
+    cases_per_rank, remainder = divmod(max_cases, world_size)
+    return cases_per_rank + int(rank < remainder)
+
+
 def save_permutation_error(data, error_dir: str = None, max_cases: int = 50):
     """
     Saves the permutation error data to a specified directory.
@@ -122,17 +173,41 @@ def save_permutation_error(data, error_dir: str = None, max_cases: int = 50):
     if error_dir is None:
         return
 
-    # error_dir = os.path.join(self.error_dir, dir_name)
-    os.makedirs(error_dir, exist_ok=True)
+    temporary_path = None
+    try:
+        rank, world_size = _get_global_rank_and_world_size()
+        rank_quota = _rank_case_quota(max_cases, rank, world_size)
+        if rank_quota == 0:
+            return
 
-    if len(os.listdir(error_dir)) >= max_cases:
-        # Only record the first {max_cases} error cases for debug
-        return
+        os.makedirs(error_dir, exist_ok=True)
+        rank_prefix = f"T_rank{rank:05d}_"
+        rank_case_count = sum(
+            filename.startswith(rank_prefix) and filename.endswith(".pt")
+            for filename in os.listdir(error_dir)
+        )
+        if rank_case_count >= rank_quota:
+            return
 
-    filename = "T_" + time.strftime("%Y%m%d_%H%M%S") + ".pt"
-    fpath = os.path.join(error_dir, filename)
-    if not os.path.exists(fpath):
-        try:
-            torch.save(data, fpath)
-        except Exception as e:
-            print(f"Exception occurrs in save_permutation_error: {e}")
+        counter = next(_PERMUTATION_ERROR_SAVE_COUNTER)
+        filename = (
+            f"{rank_prefix}pid{os.getpid()}_ns{time.time_ns()}_"
+            f"{counter:08d}.pt"
+        )
+        final_path = os.path.join(error_dir, filename)
+        temporary_path = os.path.join(
+            error_dir,
+            f".{filename}.tmp.{os.getpid()}.{counter}",
+        )
+
+        cpu_snapshot = _snapshot_to_cpu(data)
+        torch.save(cpu_snapshot, temporary_path)
+        os.replace(temporary_path, final_path)
+    except Exception as e:
+        if temporary_path is not None:
+            try:
+                if os.path.exists(temporary_path):
+                    os.remove(temporary_path)
+            except OSError:
+                pass
+        print(f"Exception occurs in save_permutation_error: {e}")

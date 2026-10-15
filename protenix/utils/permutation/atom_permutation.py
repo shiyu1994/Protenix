@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import traceback
+
 import torch
 
 from protenix.metrics.rmsd import rmsd, self_aligned_rmsd
@@ -20,6 +22,39 @@ from protenix.utils.logger import get_logger
 from protenix.utils.permutation.utils import Checker, save_permutation_error
 
 logger = get_logger(__name__)
+
+_ATOM_PERMUTATION_ERROR_LOG_LIMIT = 3
+_atom_permutation_error_log_count = 0
+
+
+def _log_atom_permutation_error(
+    error_summary: str,
+    dataset_name: str = None,
+    pdb_id: str = None,
+) -> None:
+    """Log a bounded number of summaries while keeping tracebacks in artifacts."""
+    global _atom_permutation_error_log_count
+
+    if _atom_permutation_error_log_count >= _ATOM_PERMUTATION_ERROR_LOG_LIMIT:
+        return
+
+    _atom_permutation_error_log_count += 1
+    context = []
+    if dataset_name:
+        context.append(f"dataset={dataset_name}")
+    if pdb_id:
+        context.append(f"pdb_id={pdb_id}")
+    context_suffix = f" ({', '.join(context)})" if context else ""
+    suppression_suffix = ""
+    if _atom_permutation_error_log_count == _ATOM_PERMUTATION_ERROR_LOG_LIMIT:
+        suppression_suffix = (
+            " Subsequent atom-permutation error warnings are suppressed in "
+            "this process; bounded diagnostic artifacts remain enabled."
+        )
+    logger.warning(
+        f"Atom permutation failed{context_suffix}: {error_summary}."
+        f"{suppression_suffix}"
+    )
 
 
 def run(
@@ -84,12 +119,16 @@ def run(
             return {"coordinate": permuted_coord}, info_dict, indices_permutation
 
     except Exception as e:
-        error_message = str(e)
-        if dataset_name:
-            logger.warning(f"dataset: {dataset_name}")
-        if pdb_id:
-            logger.warning(f"pdb id: {pdb_id}")
-        logger.warning(error_message)
+        error_summary = f"{type(e).__name__}: {e}"
+        error_message = (
+            f"{error_summary}\n"
+            f"{traceback.format_exc()}"
+        )
+        _log_atom_permutation_error(
+            error_summary=error_summary,
+            dataset_name=dataset_name,
+            pdb_id=pdb_id,
+        )
         save_permutation_error(
             data={
                 "error_message": error_message,

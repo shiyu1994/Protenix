@@ -26,6 +26,8 @@ class TestMolGroupType(unittest.TestCase):
         col2 = df["mol_2_type"].astype(str).str.replace("nan", "intra", regex=False)
         lo = np.where(col1.values <= col2.values, col1.values, col2.values)
         hi = np.where(col1.values <= col2.values, col2.values, col1.values)
+        lo = np.asarray(lo, dtype=str)
+        hi = np.asarray(hi, dtype=str)
         return pd.Series(np.char.add(np.char.add(lo, "_"), hi), index=df.index)
 
     def test_basic(self):

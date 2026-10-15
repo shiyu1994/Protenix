@@ -12,9 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import csv as csv_module
 import gzip
 import json
 import pickle
+import secrets
 import time
 from typing import Any, TYPE_CHECKING, Union
 
@@ -60,10 +62,38 @@ PANDAS_NA_VALUES = [
 
 _INDICES_CSV_CACHE: dict[str, pd.DataFrame] = {}
 _JSON_FILE_CACHE: dict[str, Any] = {}
+_NON_TRAINING_INDEX_ARTIFACT_ROLES = {
+    "distillation_bioassembly_conversion_audit",
+    "distillation_bioassembly_leaf_audit",
+    "distillation_bioassembly_finalize",
+}
+
+
+def _read_indices_artifact_role(csv_path: str) -> str | None:
+    if csv_path.endswith(".parquet"):
+        return None
+    opener = gzip.open if csv_path.endswith(".gz") else open
+    with opener(
+        csv_path,
+        "rt",
+        encoding="utf-8",
+        newline="",
+    ) as stream:
+        reader = csv_module.DictReader(stream)
+        if "artifact_role" not in (reader.fieldnames or []):
+            return None
+        first_row = next(reader, None)
+    if first_row is None:
+        return None
+    role = str(first_row.get("artifact_role", "")).strip()
+    return role or None
 
 
 def read_indices_csv(
-    csv: Union[str, Path], load_indice_mode: str = "full"
+    csv: Union[str, Path],
+    load_indice_mode: str = "full",
+    *,
+    allow_non_training_audit: bool = False,
 ) -> pd.DataFrame:
     """
     Read a csv file without the content changing.
@@ -71,11 +101,23 @@ def read_indices_csv(
     Args:
         csv (Union[str, Path]): A csv file path.
         load_indice_mode (str): Mode to load indices. Defaults to "full".
+        allow_non_training_audit (bool): Explicitly permit conversion audit
+            artifacts. Training callers must keep the default ``False``.
 
     Returns:
         pd.DataFrame : A pandas DataFrame.
     """
     csv_str = str(csv)
+    artifact_role = _read_indices_artifact_role(csv_str)
+    if (
+        not allow_non_training_audit
+        and artifact_role in _NON_TRAINING_INDEX_ARTIFACT_ROLES
+    ):
+        raise ValueError(
+            f"{csv_str} is a non-training audit artifact "
+            f"({artifact_role}); use the authoritative clustered "
+            "distillation catalog instead"
+        )
 
     if csv_str in _INDICES_CSV_CACHE:
         df_cached = _INDICES_CSV_CACHE[csv_str]
@@ -287,16 +329,131 @@ def load_gzip_pickle(pkl: Union[str, Path]) -> Any:
     return data
 
 
-def dump_gzip_pickle(data: Any, pkl: Union[str, Path]):
+def dump_gzip_pickle(
+    data: Any,
+    pkl: Union[str, Path],
+    compression_level: int = 9,
+    protocol: int | None = None,
+    atomic: bool = False,
+    durable: bool = False,
+    *,
+    compresslevel: int | None = None,
+) -> None:
     """
     Dump a gzip pickle file.
 
     Args:
         data (Any): The data to be dumped.
         pkl (Union[str, Path]): A gzip pickle file path.
+        compression_level (int): Gzip compression level. Defaults to 9 for
+            compatibility with :func:`gzip.open`.
+        protocol (int | None): Pickle protocol. ``None`` preserves the default
+            protocol used by :func:`pickle.dump`.
+        atomic (bool): Write to a temporary file in the destination directory
+            and atomically replace the destination after a successful dump.
+        durable (bool): Synchronize file contents and the destination directory
+            before returning. Disabled by default to avoid one ``fsync`` per
+            sample during bulk conversion.
+        compresslevel (int | None): Backward-compatible alias for
+            ``compression_level``.
     """
-    with gzip.open(pkl, "wb") as f:
-        pickle.dump(data, f)
+    if compresslevel is not None:
+        if compression_level != 9 and compression_level != compresslevel:
+            raise ValueError(
+                "compression_level and compresslevel disagree: "
+                f"{compression_level} != {compresslevel}"
+            )
+        compression_level = compresslevel
+    if not 0 <= compression_level <= 9:
+        raise ValueError(
+            "compression_level must be in [0, 9], "
+            f"got {compression_level}"
+        )
+
+    destination = Path(pkl)
+    temporary_path: Path | None = None
+    output_path = destination
+    file_descriptor: int | None = None
+    file_contents_synced = False
+
+    try:
+        if atomic:
+            try:
+                destination_mode = destination.stat().st_mode & 0o777
+            except FileNotFoundError:
+                destination_mode = None
+            for _ in range(100):
+                candidate = destination.with_name(
+                    f".{destination.name}.{secrets.token_hex(8)}.tmp"
+                )
+                try:
+                    file_descriptor = os.open(
+                        candidate,
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                        0o666,
+                    )
+                except FileExistsError:
+                    continue
+                temporary_path = candidate
+                break
+            else:
+                raise FileExistsError(
+                    f"Unable to create an atomic temporary file for {destination}"
+                )
+            if destination_mode is not None:
+                os.fchmod(file_descriptor, destination_mode)
+            output_path = temporary_path
+
+        if atomic:
+            raw_stream = os.fdopen(file_descriptor, "wb")
+            file_descriptor = None
+            with raw_stream:
+                with gzip.GzipFile(
+                    fileobj=raw_stream,
+                    mode="wb",
+                    compresslevel=compression_level,
+                ) as f:
+                    if protocol is None:
+                        pickle.dump(data, f)
+                    else:
+                        pickle.dump(data, f, protocol=protocol)
+                raw_stream.flush()
+                if durable:
+                    os.fsync(raw_stream.fileno())
+                    file_contents_synced = True
+        else:
+            with gzip.open(
+                output_path,
+                "wb",
+                compresslevel=compression_level,
+            ) as f:
+                if protocol is None:
+                    pickle.dump(data, f)
+                else:
+                    pickle.dump(data, f, protocol=protocol)
+
+        if durable and not file_contents_synced:
+            with output_path.open("rb") as f:
+                os.fsync(f.fileno())
+
+        if atomic:
+            os.replace(output_path, destination)
+            temporary_path = None
+
+        if durable and hasattr(os, "O_DIRECTORY"):
+            directory_fd = os.open(destination.parent, os.O_DIRECTORY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+    finally:
+        if file_descriptor is not None:
+            os.close(file_descriptor)
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink()
+            except FileNotFoundError:
+                pass
 
 
 def pdb_to_cif(pdb_file: str, cif_file: str, sequence=None):

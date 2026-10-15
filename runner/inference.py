@@ -148,9 +148,11 @@ class InferenceRunner(object):
         Raises:
             FileNotFoundError: If the checkpoint path does not exist.
         """
-        checkpoint_path = opjoin(
-            self.configs.load_checkpoint_dir, f"{self.configs.model_name}.pt"
-        )
+        checkpoint_path = self.configs.load_checkpoint_dir
+        # if  opexists(f"{checkpoint_path}.pt"):
+        #     checkpoint_path = opjoin(
+        #         self.configs.load_checkpoint_dir, f"{self.configs.model_name}.pt"
+        #     )
         if not opexists(checkpoint_path):
             raise FileNotFoundError(
                 f"Given checkpoint path not exist [{checkpoint_path}]"
@@ -335,7 +337,8 @@ def download_inference_cache(configs: Any) -> None:
             else:
                 logger.info(f"{cache_name} already exists at {cur_cache_fpath}")
 
-    checkpoint_path = f"{configs.load_checkpoint_dir}/{configs.model_name}.pt"
+    # checkpoint_path = f"{configs.load_checkpoint_dir}/{configs.model_name}.pt"
+    checkpoint_path = configs.load_checkpoint_dir
     checkpoint_dir = configs.load_checkpoint_dir
 
     if not opexists(checkpoint_path):

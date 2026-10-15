@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
+import logging
+import os
 from functools import partial
 from typing import Any, Callable, List, Optional, Sequence, Tuple, Union
 
@@ -23,6 +24,56 @@ import torch.nn as nn
 from scipy.spatial.transform import Rotation
 
 from protenix.utils.scatter_utils import scatter
+
+_MSA_SAMPLE_INDICES_DEBUG_COUNT = 0
+_DEFAULT_MSA_QUERY_INCLUSION_MAX_SAMPLE_SIZE = 0
+
+
+def _env_int(name: str, default: int = 0) -> int:
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        logging.warning("Ignoring invalid integer env %s=%r", name, value)
+        return default
+
+
+def _distributed_rank() -> int:
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return torch.distributed.get_rank()
+    return 0
+
+
+def _log_msa_sample_indices_debug(
+    *,
+    n: int,
+    lower_bound: int,
+    upper_bound: int,
+    sample_size: int,
+    strategy: str,
+    query_inclusion_max_sample_size: int,
+) -> None:
+    global _MSA_SAMPLE_INDICES_DEBUG_COUNT  # pylint: disable=global-statement
+    limit = _env_int("PROTENIX_MSA_SAMPLE_DEBUG_LOG_LIMIT", 0)
+    if _MSA_SAMPLE_INDICES_DEBUG_COUNT >= limit:
+        return
+    logging.info(
+        "[MSA_DEBUG][sample_indices] rank=%s n=%s lower_bound=%s "
+        "upper_bound=%s randint_low=%s randint_high_exclusive=%s "
+        "sample_size=%s strategy=%s query_inclusion_max_sample_size=%s",
+        _distributed_rank(),
+        n,
+        lower_bound,
+        upper_bound,
+        min(lower_bound, upper_bound),
+        upper_bound + 1,
+        sample_size,
+        strategy,
+        query_inclusion_max_sample_size,
+    )
+    _MSA_SAMPLE_INDICES_DEBUG_COUNT += 1
 
 
 def centre_random_augmentation(
@@ -292,20 +343,77 @@ def sample_indices(
     device: torch.device = torch.device("cpu"),
     lower_bound: int = 1,
     strategy: str = "random",
+    upper_bound: Optional[int] = None,
+    query_inclusion_max_sample_size: int = (
+        _DEFAULT_MSA_QUERY_INCLUSION_MAX_SAMPLE_SIZE
+    ),
 ) -> torch.Tensor:
-    """Sample msa indices k from uniform[1,n]
+    """Sample MSA row indices without replacement.
 
     Args:
         n (int): the msa num
+        lower_bound (int): minimum sampled row count, clamped to the legal range.
         strategy (str): the strategy to sample msa index, random or topk
+        upper_bound (int, optional): maximum sampled row count. The rows are
+            still selected from all ``n`` inputs. If omitted, use ``n``.
+        query_inclusion_max_sample_size (int): For random sampling with a
+            positive sampled depth no larger than this value, always include
+            row zero within the sampled depth. Zero disables this policy.
 
     Returns:
         torch.Tensor: the sampled indices k
     """
     assert strategy in ["random", "topk"]
-    sample_size = torch.randint(low=min(lower_bound, n), high=n + 1, size=(1,)).item()
+    if (
+        isinstance(query_inclusion_max_sample_size, (bool, np.bool_))
+        or not isinstance(
+            query_inclusion_max_sample_size,
+            (int, np.integer),
+        )
+    ):
+        raise TypeError(
+            "query_inclusion_max_sample_size must be a non-negative integer, "
+            f"got {query_inclusion_max_sample_size!r}"
+        )
+    query_inclusion_max_sample_size = int(query_inclusion_max_sample_size)
+    if query_inclusion_max_sample_size < 0:
+        raise ValueError(
+            "query_inclusion_max_sample_size must be >= 0, got "
+            f"{query_inclusion_max_sample_size}"
+        )
+    sample_upper_bound = n
+    if upper_bound is not None and upper_bound > 0:
+        sample_upper_bound = min(n, upper_bound)
+    sample_lower_bound = min(lower_bound, sample_upper_bound)
+    sample_size = torch.randint(
+        low=sample_lower_bound,
+        high=sample_upper_bound + 1,
+        size=(1,),
+    ).item()
+    _log_msa_sample_indices_debug(
+        n=n,
+        lower_bound=lower_bound,
+        upper_bound=sample_upper_bound,
+        sample_size=sample_size,
+        strategy=strategy,
+        query_inclusion_max_sample_size=query_inclusion_max_sample_size,
+    )
     if strategy == "random":
-        indices = torch.randperm(n=n, device=device)[:sample_size]
+        permutation = torch.randperm(n=n, device=device)
+        if 0 < sample_size <= query_inclusion_max_sample_size and n > 0:
+            # Preserve the old randperm(n) RNG call, but reserve one of the K
+            # sampled slots for the authoritative query row at index zero.
+            # Filtering row zero before taking K-1 keeps the sample unique and
+            # the final depth exactly K rather than appending a K+1st row.
+            non_query_indices = permutation[permutation != 0]
+            indices = torch.cat(
+                [
+                    permutation.new_zeros(1),
+                    non_query_indices[: sample_size - 1],
+                ]
+            )
+        else:
+            indices = permutation[:sample_size]
     if strategy == "topk":
         indices = torch.arange(sample_size, device=device)
     return indices
@@ -317,6 +425,9 @@ def sample_msa_feature_dict_random_without_replacement(
     cutoff: int = 512,
     lower_bound: int = 1,
     strategy: str = "random",
+    query_inclusion_max_sample_size: int = (
+        _DEFAULT_MSA_QUERY_INCLUSION_MAX_SAMPLE_SIZE
+    ),
 ) -> dict[str, torch.Tensor]:
     """Sample a dict of MSA features randomly without replacement.
 
@@ -326,6 +437,8 @@ def sample_msa_feature_dict_random_without_replacement(
         cutoff (int): The maximum number of features to sample.
         lower_bound (int): The minimum number of features to sample.
         strategy (str): The sampling strategy to use. Can be either "random" or "sequential".
+        query_inclusion_max_sample_size (int): Maximum sampled depth at which
+            row zero is guaranteed to be included. Zero disables the policy.
 
     Returns:
         dict[str, torch.Tensor]: A dict containing the sampled MSA features.
@@ -335,10 +448,10 @@ def sample_msa_feature_dict_random_without_replacement(
         n=msa_len,
         device=feat_dict["msa"].device,
         lower_bound=lower_bound,
+        upper_bound=cutoff if cutoff > 0 else None,
         strategy=strategy,
+        query_inclusion_max_sample_size=query_inclusion_max_sample_size,
     )
-    if cutoff > 0:
-        indices = indices[:cutoff]
 
     msa_feat_dict = {
         feat_name: torch.index_select(
@@ -824,6 +937,7 @@ def checkpoint_blocks(
     blocks: List[Callable],
     args: List[Any],
     blocks_per_ckpt: Optional[int],
+    checkpoint_cpu_offload_every_n: Optional[int] = None,
 ) -> List[Any]:
     """
     Chunk a list of blocks and run each chunk with activation
@@ -841,6 +955,11 @@ def checkpoint_blocks(
             Size of each chunk. A higher value corresponds to fewer
             checkpoints, and trades memory for speed. If None, no checkpointing
             is performed.
+        checkpoint_cpu_offload_every_n:
+            Save the inputs of every Nth checkpoint region on pinned CPU memory.
+            This only affects activation-checkpoint inputs; model parameters,
+            gradients, and optimizer state remain on their original devices.
+            If None, checkpoint inputs are not offloaded.
     Returns:
         The output of the final block
     """
@@ -862,6 +981,15 @@ def checkpoint_blocks(
     # Avoids mishaps when the blocks take just one argument
     args = wrap(args)
 
+    if checkpoint_cpu_offload_every_n is not None and (
+        isinstance(checkpoint_cpu_offload_every_n, bool)
+        or not isinstance(checkpoint_cpu_offload_every_n, int)
+        or checkpoint_cpu_offload_every_n < 1
+    ):
+        raise ValueError(
+            "checkpoint_cpu_offload_every_n must be a positive integer or None"
+        )
+
     if blocks_per_ckpt is None or not torch.is_grad_enabled():
         return exec(blocks, args)
     elif blocks_per_ckpt < 1 or blocks_per_ckpt > len(blocks):
@@ -869,9 +997,17 @@ def checkpoint_blocks(
 
     checkpoint = get_checkpoint_fn()
 
-    for s in range(0, len(blocks), blocks_per_ckpt):
+    for region_index, s in enumerate(range(0, len(blocks), blocks_per_ckpt)):
         e = s + blocks_per_ckpt
-        args = checkpoint(chunker(s, e), *args)
+        should_offload = (
+            checkpoint_cpu_offload_every_n is not None
+            and (region_index + 1) % checkpoint_cpu_offload_every_n == 0
+        )
+        if should_offload:
+            with torch.autograd.graph.save_on_cpu(pin_memory=True):
+                args = checkpoint(chunker(s, e), *args)
+        else:
+            args = checkpoint(chunker(s, e), *args)
         args = wrap(args)
 
     return args

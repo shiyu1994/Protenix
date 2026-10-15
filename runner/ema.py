@@ -16,6 +16,23 @@ from typing import List, Optional
 
 import torch
 
+from protenix.utils.fsdp import reshard_fsdp2_model
+
+
+def _is_dtensor(tensor: torch.Tensor) -> bool:
+    try:
+        from torch.distributed.tensor import DTensor
+    except ImportError:
+        return False
+    return isinstance(tensor, DTensor)
+
+
+def _local_parameter_tensor(param: torch.nn.Parameter) -> torch.Tensor:
+    value = param.detach()
+    if _is_dtensor(value):
+        return value.to_local()
+    return value
+
 
 class EMAWrapper(object):
     """
@@ -33,9 +50,15 @@ class EMAWrapper(object):
         model: torch.nn.Module,
         decay: float = 0.999,
         mutable_param_keywords: Optional[List[str]] = None,
+        shadow_device: str = "model",
     ):
         self.model = model
         self.decay = decay
+        if shadow_device not in ("model", "cpu"):
+            raise ValueError(
+                f"shadow_device must be 'model' or 'cpu', got {shadow_device!r}"
+            )
+        self.shadow_device = shadow_device
         if mutable_param_keywords is not None:
             self.mutable_param_keywords = [
                 s.strip() for s in mutable_param_keywords if s.strip()
@@ -49,38 +72,107 @@ class EMAWrapper(object):
         """
         Register the model's parameters and create initial shadow copies.
         """
+        reshard_fsdp2_model(self.model)
+        self.shadow = {}
         for name, param in self.model.named_parameters():
-            self.shadow[name] = param.data.clone()
+            value = _local_parameter_tensor(param)
+            device = (
+                torch.device("cpu") if self.shadow_device == "cpu" else value.device
+            )
+            self.shadow[name] = value.to(device=device, dtype=value.dtype, copy=True)
 
     def update(self) -> None:
         """
         Update the shadow copies of the parameters using the current model weights and decay rate.
         """
-        for name, param in self.model.named_parameters():
-            if self.mutable_param_keywords and not any(
-                [keyword in name for keyword in self.mutable_param_keywords]
-            ):
-                continue
-            assert name in self.shadow
-            new_average = (1.0 - self.decay) * param.data + self.decay * self.shadow[
-                name
-            ]
-            self.shadow[name] = new_average.clone()
+        reshard_fsdp2_model(self.model)
+        with torch.no_grad():
+            for name, param in self.model.named_parameters():
+                if self.mutable_param_keywords and not any(
+                    [keyword in name for keyword in self.mutable_param_keywords]
+                ):
+                    continue
+                assert name in self.shadow
+                value = _local_parameter_tensor(param)
+                shadow = self.shadow[name]
+                param_on_shadow_device = value.to(
+                    device=shadow.device,
+                    dtype=shadow.dtype,
+                    copy=self.shadow_device == "cpu",
+                    non_blocking=False,
+                )
+                # Keep train2's allocation-free in-place EMA update.
+                shadow.mul_(self.decay).add_(
+                    param_on_shadow_device, alpha=1.0 - self.decay
+                )
 
     def apply_shadow(self) -> None:
         """
         Apply the shadow copies (EMA weights) to the model, backing up current weights.
         """
-        for name, param in self.model.named_parameters():
-            assert name in self.shadow
-            self.backup[name] = param.data
-            param.data = self.shadow[name]
+        reshard_fsdp2_model(self.model)
+        with torch.no_grad():
+            for name, param in self.model.named_parameters():
+                assert name in self.shadow
+                if _is_dtensor(param):
+                    value = _local_parameter_tensor(param)
+                    backup_device = (
+                        torch.device("cpu")
+                        if self.shadow_device == "cpu"
+                        else value.device
+                    )
+                    self.backup[name] = value.to(
+                        device=backup_device,
+                        dtype=value.dtype,
+                        copy=True,
+                    )
+                    value.copy_(
+                        self.shadow[name].to(
+                            device=value.device,
+                            dtype=value.dtype,
+                            non_blocking=True,
+                        )
+                    )
+                elif self.shadow_device == "model":
+                    self.backup[name] = param.data
+                    param.data = self.shadow[name]
+                else:
+                    self.backup[name] = param.detach().to(
+                        device="cpu", dtype=param.dtype, copy=True
+                    )
+                    param.copy_(
+                        self.shadow[name].to(
+                            device=param.device,
+                            dtype=param.dtype,
+                            non_blocking=True,
+                        )
+                    )
 
     def restore(self) -> None:
         """
         Restore the original model weights from the backup.
         """
-        for name, param in self.model.named_parameters():
-            assert name in self.backup
-            param.data = self.backup[name]
+        reshard_fsdp2_model(self.model)
+        with torch.no_grad():
+            for name, param in self.model.named_parameters():
+                assert name in self.backup
+                if _is_dtensor(param):
+                    value = _local_parameter_tensor(param)
+                    value.copy_(
+                        self.backup[name].to(
+                            device=value.device,
+                            dtype=value.dtype,
+                            non_blocking=True,
+                        )
+                    )
+                elif self.shadow_device == "model":
+                    param.data = self.backup[name]
+                else:
+                    param.copy_(
+                        self.backup[name].to(
+                            device=param.device,
+                            dtype=param.dtype,
+                            non_blocking=True,
+                        )
+                    )
         self.backup = {}

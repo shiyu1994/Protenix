@@ -133,6 +133,17 @@ Key arguments in `inference_demo.sh`:
 
 ## 🧬 Training
 
+For this repository's 33.5-million-structure AFDB + MGnify distillation
+dataset, compact mmap index, hierarchical runtime sampling, and 16-node launch
+commands, see
+[AFDB + MGnify distillation training integration](./afdb_mgnify_distillation_cluster_index_cn.md).
+
+For the OpenFold3 disordered cross-distillation dataset, including the
+28,567-entry official-cache subset, alignment representatives, resumable NPZ
+conversion, 0.50/0.50/0.02 raw sampling-mass profile, and dedicated scratch/resume
+launchers, see
+[OpenFold3 disordered distillation integration](./openfold3_disordered_distillation_cn.md).
+
 ### Preparing the datasets
 To download the [wwPDB dataset](https://www.wwpdb.org/) and preprocessed training data, you need at least 1.5T disk space.
 
@@ -216,6 +227,8 @@ If you want to fine-tune the model on a specific subset (e.g., a specific set of
 ```bash
 bash finetune_demo.sh
 ```
+
+For the local 2026-data fine-tuning workflow, distributed launch options, and decoupled validation usage, see [finetune_demo.sh usage](./finetune_demo_usage.md).
 
 Key arguments for fine-tuning:
 * `load_checkpoint_path` / `load_ema_checkpoint_path`: Paths to the pretrained model and its EMA weights.

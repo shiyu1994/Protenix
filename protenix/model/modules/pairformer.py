@@ -13,7 +13,10 @@
 # limitations under the License.
 
 # pylint: disable=C0114
+import logging
+import os
 from functools import partial
+from numbers import Integral
 from typing import Any, Optional
 
 import torch
@@ -39,6 +42,23 @@ from protenix.model.utils import (
 )
 
 
+def _env_int(name: str, default: int = 0) -> int:
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        logging.warning("Ignoring invalid integer env %s=%r", name, value)
+        return default
+
+
+def _distributed_rank() -> int:
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return torch.distributed.get_rank()
+    return 0
+
+
 class PairformerBlock(nn.Module):
     """Implements Algorithm 17 [Line2-Line8] in AF3
 
@@ -57,6 +77,10 @@ class PairformerBlock(nn.Module):
         num_intermediate_factor (int, optional): number of intermediate factor for pair_transition. Defaults to 4.
         dropout (float, optional): dropout ratio [for TriangleUpdate]. Defaults to 0.25.
         hidden_scale_up (bool, optional): whether scale up the hidden if c_z scales. Defaults to False.
+        train_pair_transition_chunk_size (Optional[int]): chunk size on pair rows
+            for pair_transition during training. Defaults to None.
+        train_pair_transition_checkpoint_chunks (bool): whether to checkpoint each
+            training pair_transition chunk. Defaults to False.
     """
 
     def __init__(
@@ -70,6 +94,8 @@ class PairformerBlock(nn.Module):
         num_intermediate_factor: int = 4,
         dropout: float = 0.25,
         hidden_scale_up: bool = False,
+        train_pair_transition_chunk_size: Optional[int] = None,
+        train_pair_transition_checkpoint_chunks: bool = False,
     ) -> None:
         super(PairformerBlock, self).__init__()
         self.n_heads = n_heads
@@ -92,7 +118,12 @@ class PairformerBlock(nn.Module):
         )
         self.dropout_row = DropoutRowwise(dropout)
         self.p_drop = dropout
-        self.pair_transition = Transition(c_in=c_z, n=num_intermediate_factor)
+        self.pair_transition = Transition(
+            c_in=c_z,
+            n=num_intermediate_factor,
+            train_chunk_size=train_pair_transition_chunk_size,
+            train_checkpoint_chunks=train_pair_transition_checkpoint_chunks,
+        )
         self.c_s = c_s
         if self.c_s > 0:
             self.attention_pair_bias = AttentionPairBias(
@@ -236,7 +267,13 @@ class PairformerStack(nn.Module):
         num_intermediate_factor (int, optional): number of intermediate factor for transition. Defaults to 4.
         dropout (float, optional): dropout ratio. Defaults to 0.25.
         blocks_per_ckpt (int, optional): number of Pairformer blocks in each activation checkpoint. Defaults to None.
+        checkpoint_cpu_offload_every_n (int, optional): save every Nth
+            activation-checkpoint region input on pinned CPU memory. Defaults to None.
         hidden_scale_up (bool, optional): whether scale up the hidden if c_z scales. Defaults to False.
+        train_pair_transition_chunk_size (Optional[int]): chunk size on pair rows
+            for pair_transition during training. Defaults to None.
+        train_pair_transition_checkpoint_chunks (bool): whether to checkpoint each
+            training pair_transition chunk. Defaults to False.
     """
 
     def __init__(
@@ -248,12 +285,16 @@ class PairformerStack(nn.Module):
         num_intermediate_factor: int = 4,
         dropout: float = 0.25,
         blocks_per_ckpt: Optional[int] = None,
+        checkpoint_cpu_offload_every_n: Optional[int] = None,
         hidden_scale_up: bool = False,
+        train_pair_transition_chunk_size: Optional[int] = None,
+        train_pair_transition_checkpoint_chunks: bool = False,
     ) -> None:
         super(PairformerStack, self).__init__()
         self.n_blocks = n_blocks
         self.n_heads = n_heads
         self.blocks_per_ckpt = blocks_per_ckpt
+        self.checkpoint_cpu_offload_every_n = checkpoint_cpu_offload_every_n
         self.blocks = nn.ModuleList()
 
         for _ in range(n_blocks):
@@ -264,6 +305,8 @@ class PairformerStack(nn.Module):
                 num_intermediate_factor=num_intermediate_factor,
                 dropout=dropout,
                 hidden_scale_up=hidden_scale_up,
+                train_pair_transition_chunk_size=train_pair_transition_chunk_size,
+                train_pair_transition_checkpoint_chunks=train_pair_transition_checkpoint_chunks,
             )
             self.blocks.append(block)
 
@@ -336,6 +379,7 @@ class PairformerStack(nn.Module):
             blocks,
             args=(s, z),
             blocks_per_ckpt=blocks_per_ckpt,
+            checkpoint_cpu_offload_every_n=self.checkpoint_cpu_offload_every_n,
         )
         return s, z
 
@@ -692,6 +736,8 @@ class MSAModule(nn.Module):
         msa_dropout (float, optional): dropout ratio for msa block. Defaults to 0.15.
         pair_dropout (float, optional): dropout ratio for pair stack. Defaults to 0.25.
         blocks_per_ckpt: number of MSAModule blocks in each activation checkpoint. Defaults to 1.
+        checkpoint_cpu_offload_every_n (int, optional): save every Nth MSA
+            activation-checkpoint region input on pinned CPU memory. Defaults to None.
         msa_chunk_size (int, optional): chunk size for msa. Defaults to 2048.
         msa_max_size (int, optional): max size for msa. Defaults to 16384.
         msa_configs (dict, optional): a dictionary containing keys: "enable", "strategy", etc. Defaults to None.
@@ -707,6 +753,7 @@ class MSAModule(nn.Module):
         msa_dropout: float = 0.15,
         pair_dropout: float = 0.25,
         blocks_per_ckpt: Optional[int] = 1,
+        checkpoint_cpu_offload_every_n: Optional[int] = None,
         msa_chunk_size: Optional[int] = 2048,
         msa_max_size: Optional[int] = 16384,
         msa_configs: Optional[dict[str, Any]] = None,
@@ -717,8 +764,12 @@ class MSAModule(nn.Module):
         self.c_m = c_m
         self.c_s_inputs = c_s_inputs
         self.blocks_per_ckpt = blocks_per_ckpt
+        self.checkpoint_cpu_offload_every_n = checkpoint_cpu_offload_every_n
         self.msa_chunk_size = msa_chunk_size
         self.msa_max_size = msa_max_size
+        self._last_msa_input_depth: Optional[int] = None
+        self._last_msa_sampled_depth: Optional[int] = None
+        self._msa_depth_trace: list[dict[str, Optional[int]]] = []
         self.input_feature = {
             "msa": 32,
             "has_deletion": 1,
@@ -729,6 +780,10 @@ class MSAModule(nn.Module):
             "enable": msa_configs.get("enable", False),
             "strategy": msa_configs.get("strategy", "random"),
         }
+        self.msa_sample_debug_log_limit = _env_int(
+            "PROTENIX_MSA_SAMPLE_DEBUG_LOG_LIMIT", 0
+        )
+        self.msa_sample_debug_log_count = 0
         if "sample_cutoff" in msa_configs:
             self.msa_configs["train_cutoff"] = msa_configs["sample_cutoff"].get(
                 "train", 512
@@ -741,6 +796,28 @@ class MSAModule(nn.Module):
         if "min_size" in msa_configs:
             self.msa_configs["train_lowerb"] = msa_configs["min_size"].get("train", 1)
             self.msa_configs["test_lowerb"] = msa_configs["min_size"].get("test", 1)
+        query_inclusion_config = msa_configs.get(
+            "query_inclusion_max_sample_size",
+            {"train": 0, "test": 0},
+        )
+        for stage in ("train", "test"):
+            value = (
+                query_inclusion_config.get(stage, 0)
+                if hasattr(query_inclusion_config, "get")
+                else query_inclusion_config
+            )
+            if isinstance(value, bool) or not isinstance(value, Integral):
+                raise TypeError(
+                    "data.msa.query_inclusion_max_sample_size."
+                    f"{stage} must be a non-negative integer, got {value!r}"
+                )
+            value = int(value)
+            if value < 0:
+                raise ValueError(
+                    "data.msa.query_inclusion_max_sample_size."
+                    f"{stage} must be >= 0, got {value}"
+                )
+            self.msa_configs[f"{stage}_query_inclusion_max_sample_size"] = value
 
         self.linear_no_bias_m = LinearNoBias(
             in_features=32 + 1 + 1, out_features=self.c_m
@@ -763,6 +840,67 @@ class MSAModule(nn.Module):
                 hidden_scale_up=hidden_scale_up,
             )
             self.blocks.append(block)
+
+    @property
+    def last_msa_input_depth(self) -> Optional[int]:
+        """Input MSA depth observed by the most recent forward call."""
+        return self._last_msa_input_depth
+
+    @property
+    def last_msa_sampled_depth(self) -> Optional[int]:
+        """Sampled MSA depth produced by the most recent forward call."""
+        return self._last_msa_sampled_depth
+
+    @property
+    def msa_depth_trace(self) -> tuple[dict[str, Optional[int]], ...]:
+        """Per-forward MSA depths since the most recent explicit reset."""
+        return tuple(dict(record) for record in self._msa_depth_trace)
+
+    def reset_msa_depth_trace(self) -> None:
+        """Reset the runtime-only MSA depth observations."""
+        self._last_msa_input_depth = None
+        self._last_msa_sampled_depth = None
+        self._msa_depth_trace.clear()
+
+    def _record_msa_depth(
+        self,
+        input_depth: Optional[int],
+        sampled_depth: Optional[int],
+    ) -> None:
+        self._last_msa_input_depth = input_depth
+        self._last_msa_sampled_depth = sampled_depth
+        self._msa_depth_trace.append(
+            {"input_depth": input_depth, "sampled_depth": sampled_depth}
+        )
+
+    def _log_msa_sample_debug(
+        self,
+        input_msa_shape: torch.Size,
+        sampled_msa_shape: torch.Size,
+        cutoff: int,
+        lower_bound: int,
+        query_inclusion_max_sample_size: int,
+    ) -> None:
+        if self.msa_sample_debug_log_count >= self.msa_sample_debug_log_limit:
+            return
+        logging.info(
+            "[MSA_DEBUG][sample] rank=%s training=%s input_msa_shape=%s "
+            "sampled_msa_shape=%s cutoff=%s lower_bound=%s strategy=%s "
+            "query_inclusion_max_sample_size=%s n_blocks=%s "
+            "msa_chunk_size=%s msa_max_size=%s",
+            _distributed_rank(),
+            self.training,
+            list(input_msa_shape),
+            list(sampled_msa_shape),
+            cutoff,
+            lower_bound,
+            self.msa_configs["strategy"],
+            query_inclusion_max_sample_size,
+            self.n_blocks,
+            self.msa_chunk_size,
+            self.msa_max_size,
+        )
+        self.msa_sample_debug_log_count += 1
 
     def _prep_blocks(
         self,
@@ -841,30 +979,56 @@ class MSAModule(nn.Module):
             torch.Tensor: the updated z
                 [..., N_token, N_token, c_z]
         """
+        self._last_msa_input_depth = None
+        self._last_msa_sampled_depth = None
         # If n_blocks < 1, return z
         if self.n_blocks < 1:
+            self._record_msa_depth(None, None)
             return z
 
         if "msa" not in input_feature_dict:
+            self._record_msa_depth(None, None)
             return z
         # Check msa shape!
         # IndexError: Dimension out of range (expected to be in range of [-1, 0], but got -2)
         if input_feature_dict["msa"].dim() < 2:
+            self._record_msa_depth(None, None)
             return z
+        input_msa_shape = input_feature_dict["msa"].shape
+        input_msa_depth = int(input_msa_shape[-2])
+        cutoff = (
+            self.msa_configs["train_cutoff"]
+            if self.training
+            else self.msa_configs["test_cutoff"]
+        )
+        lower_bound = (
+            self.msa_configs["train_lowerb"]
+            if self.training
+            else self.msa_configs["test_lowerb"]
+        )
+        query_inclusion_max_sample_size = self.msa_configs[
+            (
+                "train_query_inclusion_max_sample_size"
+                if self.training
+                else "test_query_inclusion_max_sample_size"
+            )
+        ]
         msa_feat = sample_msa_feature_dict_random_without_replacement(
             feat_dict=input_feature_dict,
             dim_dict={feat_name: -2 for feat_name in self.input_feature},
-            cutoff=(
-                self.msa_configs["train_cutoff"]
-                if self.training
-                else self.msa_configs["test_cutoff"]
-            ),
-            lower_bound=(
-                self.msa_configs["train_lowerb"]
-                if self.training
-                else self.msa_configs["test_lowerb"]
-            ),
+            cutoff=cutoff,
+            lower_bound=lower_bound,
             strategy=self.msa_configs["strategy"],
+            query_inclusion_max_sample_size=query_inclusion_max_sample_size,
+        )
+        sampled_msa_depth = int(msa_feat["msa"].shape[-2])
+        self._record_msa_depth(input_msa_depth, sampled_msa_depth)
+        self._log_msa_sample_debug(
+            input_msa_shape=input_msa_shape,
+            sampled_msa_shape=msa_feat["msa"].shape,
+            cutoff=cutoff,
+            lower_bound=lower_bound,
+            query_inclusion_max_sample_size=query_inclusion_max_sample_size,
         )
         # pylint: disable=E1102
         if not self.training and z.shape[-2] > 2000:
@@ -912,6 +1076,7 @@ class MSAModule(nn.Module):
             blocks,
             args=(msa_sample, z),
             blocks_per_ckpt=blocks_per_ckpt,
+            checkpoint_cpu_offload_every_n=self.checkpoint_cpu_offload_every_n,
         )
         return z
 

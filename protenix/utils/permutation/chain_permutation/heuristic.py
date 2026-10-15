@@ -457,7 +457,7 @@ class MultiChainPermutation(object):
 
         return {"entity_to_asym": entity_to_asym, "asym_to_entity": asym_to_entity}
 
-    def find_anchor_asym_chain_in_predictions(self) -> tuple[int]:
+    def find_anchor_asym_chain_in_predictions(self) -> int | None:
         """
         Find anchor chains in the prediction.
 
@@ -494,9 +494,15 @@ class MultiChainPermutation(object):
         valid_entity_asym = [
             (ent, asym.item())
             for ent in valid_entities
-            for asym in self.pred_token_dict["entity_to_asym"][ent]
+            for asym in self.pred_token_dict["entity_to_asym"].get(ent, [])
             if asym.item() in valid_asyms
         ]
+        if not valid_entity_asym:
+            logger.warning(
+                "No valid chain permutation anchor candidates after filtering "
+                "short prediction chains and unresolved ground-truth chains."
+            )
+            return None
 
         candidate_entities = set(ent for ent, _ in valid_entity_asym)
 
@@ -521,6 +527,9 @@ class MultiChainPermutation(object):
             k: len(self.label_token_dict["entity_to_asym"][k])
             for k in candidate_entities
         }
+        if not entity_to_asym_count:
+            logger.warning("No chain permutation candidate entities found.")
+            return None
         min_asym_count = min(list(entity_to_asym_count.values()))
         candidate_entities = [
             ent
@@ -532,6 +541,9 @@ class MultiChainPermutation(object):
         candidate_asyms = [
             asym_id for ent, asym_id in valid_entity_asym if ent in candidate_entities
         ]
+        if not candidate_asyms:
+            logger.warning("No chain permutation candidate asym IDs found.")
+            return None
         max_asym_length = max(
             asym_to_asym_length[asym_id] for asym_id in candidate_asyms
         )
@@ -574,6 +586,8 @@ class MultiChainPermutation(object):
 
         # Find anchor asym chain in predictions
         anchor_pred_asym_id = self.find_anchor_asym_chain_in_predictions()
+        if anchor_pred_asym_id is None:
+            return self.unpermuted_match
         anchor_entity_id = self.pred_token_dict["asym_to_entity"][anchor_pred_asym_id]
 
         if self.find_gt_anchor_first:
@@ -661,7 +675,12 @@ class MultiChainPermutation(object):
                 best_rmsd = total_rmsd
                 best_match = matched_asym
 
-        assert best_match is not None
+        if best_match is None:
+            logger.warning(
+                "No valid chain permutation match found; keeping original chain "
+                "assignment."
+            )
+            return self.unpermuted_match
 
         return best_match
 

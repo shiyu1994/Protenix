@@ -105,7 +105,7 @@ class InferenceDataset(Dataset):
                 template_cache_dir=configs.data.template.prot_template_cache_dir,
                 max_hits=4,
                 kalign_binary_path=configs.data.template.kalign_binary_path,
-                max_template_date="2021-09-30",
+                max_template_date=configs.data.template.get("max_template_date", "2021-09-30"),
                 release_dates_path=configs.data.template.release_dates_path,
                 obsolete_pdbs_path=configs.data.template.obsolete_pdbs_path,
                 _shuffle_top_k_prefiltered=None,

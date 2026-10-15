@@ -181,6 +181,14 @@ class SmoothLDDTLoss(nn.Module):
                 [...] if reduction is None else []
         """
         lddt_indices = torch.nonzero(lddt_mask, as_tuple=True)
+        if lddt_indices[0].numel() == 0:
+            # Match the dense/OpenFold3 empty-mask value while keeping this
+            # rank connected to the coordinate graph for DDP static graphs.
+            zero_lddt = pred_coordinate.sum(dim=(-1, -2, -3)) * 0.0
+            return 1.0 - loss_reduction(
+                zero_lddt,
+                method=self.reduction,
+            )
         true_coords_l = true_coordinate.index_select(-2, lddt_indices[0])
         true_coords_m = true_coordinate.index_select(-2, lddt_indices[1])
         true_distance_sparse_lm = torch.linalg.vector_norm(
@@ -1158,6 +1166,7 @@ class MSELoss(nn.Module):
         is_rna: torch.Tensor,
         is_ligand: torch.Tensor,
         per_sample_scale: torch.Tensor = None,
+        supervision_atom_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """MSELoss
 
@@ -1172,6 +1181,9 @@ class MSELoss(nn.Module):
                 [N_atom] or [..., N_atom]
             per_sample_scale (torch.Tensor, optional): whether to scale the loss by the per-sample noise-level.
                 [..., N_sample]
+            supervision_atom_mask (torch.Tensor, optional): atoms included in
+                the MSE residual and denominator. Rigid alignment continues to
+                use every atom selected by ``coordinate_mask``.
 
         Returns:
             torch.Tensor: the weighted mse loss.
@@ -1193,8 +1205,14 @@ class MSELoss(nn.Module):
         per_atom_se = ((pred_coordinate - true_coordinate_aligned) ** 2).sum(
             dim=-1
         )  # [..., N_sample, N_atom]
-        per_sample_weighted_mse = (weight * per_atom_se).sum(dim=-1) / (
-            coordinate_mask.sum(dim=-1, keepdim=True) + self.eps
+        if supervision_atom_mask is None:
+            supervision_atom_mask = coordinate_mask
+        else:
+            supervision_atom_mask = supervision_atom_mask * coordinate_mask
+        per_sample_weighted_mse = (
+            weight * per_atom_se * supervision_atom_mask[..., None, :]
+        ).sum(dim=-1) / (
+            supervision_atom_mask.sum(dim=-1, keepdim=True) + self.eps
         )  # [..., N_sample]
 
         if per_sample_scale is not None:
@@ -1207,6 +1225,51 @@ class MSELoss(nn.Module):
         loss = loss_reduction(weighted_align_mse_loss, method=self.reduction)
 
         return loss
+
+
+def get_diffusion_supervision_masks(
+    feat_dict: dict[str, Any],
+    label_dict: dict[str, Any],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build atom and pair masks used only by diffusion MSE/smooth-LDDT.
+
+    ``coordinate_mask`` remains the source of truth for resolved coordinates
+    and for every other loss. The optional disordered-data flag narrows only
+    diffusion supervision to protein atoms, matching AF3/OpenFold3 initial
+    training without changing rigid alignment, bond, distogram, or confidence
+    semantics.
+    """
+    coordinate_mask = label_dict["coordinate_mask"]
+    disable_non_protein = feat_dict.get(
+        "disable_non_protein_diffusion_weights"
+    )
+    if disable_non_protein is None:
+        supervision_atom_mask = coordinate_mask
+    else:
+        disable_non_protein = disable_non_protein.to(
+            device=coordinate_mask.device,
+            dtype=torch.bool,
+        )
+        eligible_atom_mask = torch.logical_or(
+            ~disable_non_protein,
+            feat_dict["is_protein"].to(
+                device=coordinate_mask.device,
+                dtype=torch.bool,
+            ),
+        )
+        supervision_atom_mask = coordinate_mask * eligible_atom_mask.to(
+            dtype=coordinate_mask.dtype
+        )
+
+    supervision_pair_mask = (
+        supervision_atom_mask[..., None]
+        * supervision_atom_mask[..., None, :]
+    )
+    supervision_lddt_mask = (
+        label_dict["lddt_mask"]
+        * supervision_pair_mask.to(dtype=label_dict["lddt_mask"].dtype)
+    )
+    return supervision_atom_mask, supervision_lddt_mask
 
 
 def calculate_atom_bespoke_lddt(
@@ -1651,13 +1714,20 @@ class ProtenixLoss(nn.Module):
         else:
             # Diffusion Loss: SmoothLDDTLoss / BondLoss / MSELoss
             loss_fns = {}
+            (
+                diffusion_supervision_atom_mask,
+                diffusion_supervision_lddt_mask,
+            ) = get_diffusion_supervision_masks(
+                feat_dict=feat_dict,
+                label_dict=label_dict,
+            )
             if self.configs.loss.diffusion_lddt_loss_dense:
                 loss_fns.update(
                     {
                         "smooth_lddt_loss": lambda: self.smooth_lddt_loss.dense_forward(
                             pred_coordinate=pred_dict["coordinate"],
                             true_coordinate=label_dict["coordinate"],
-                            lddt_mask=label_dict["lddt_mask"],
+                            lddt_mask=diffusion_supervision_lddt_mask,
                             diffusion_chunk_size=self.configs.loss.diffusion_lddt_chunk_size,
                             true_distance=label_dict.get("distance"),
                         )  # it's faster is not OOM
@@ -1669,7 +1739,7 @@ class ProtenixLoss(nn.Module):
                         "smooth_lddt_loss": lambda: self.smooth_lddt_loss.sparse_forward(
                             pred_coordinate=pred_dict["coordinate"],
                             true_coordinate=label_dict["coordinate"],
-                            lddt_mask=label_dict["lddt_mask"],
+                            lddt_mask=diffusion_supervision_lddt_mask,
                             diffusion_chunk_size=self.configs.loss.diffusion_lddt_chunk_size,
                         )
                     }
@@ -1681,7 +1751,7 @@ class ProtenixLoss(nn.Module):
                             pred_distance=pred_dict["distance"],
                             true_distance=label_dict["distance"],
                             distance_mask=label_dict["distance_mask"],
-                            lddt_mask=label_dict["lddt_mask"],
+                            lddt_mask=diffusion_supervision_lddt_mask,
                             diffusion_chunk_size=self.configs.loss.diffusion_lddt_chunk_size,
                         )
                     }
@@ -1714,6 +1784,9 @@ class ProtenixLoss(nn.Module):
                         is_dna=feat_dict["is_dna"],
                         is_ligand=feat_dict["is_ligand"],
                         per_sample_scale=diffusion_per_sample_scale,
+                        supervision_atom_mask=(
+                            diffusion_supervision_atom_mask
+                        ),
                     ),
                 }
             )
