@@ -342,6 +342,14 @@ class SampleDictToFeatures:
         atom_array = self.build_full_atom_array()
         atom_array = self.add_bonds_between_entities(atom_array)
         atom_array = self.mse_to_met(atom_array)
+        if self.single_sample_dict.get("ligand_reference_overrides"):
+            from protenix.data.inference.ligand_reference import apply_ligand_references
+
+            atom_array = apply_ligand_references(
+                atom_array,
+                self.single_sample_dict["ligand_reference_overrides"],
+                self.entity_poly_type,
+            )
         atom_array = self.add_atom_array_attributes(atom_array, self.entity_poly_type)
         return atom_array
 

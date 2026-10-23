@@ -103,6 +103,16 @@ def prepare(args):
             for entry in msa_map.values()
             for p in entry.values()
         }
+    if getattr(args, "peptide_representation", "ccd") == "training-aligned":
+        signature["training_alignment"] = {
+            "reference_seed": args.reference_seed,
+            "sources": {
+                name: file_hash(REPO / name) for name in (
+                    "scripts/evaluation/peptide_training_aligned.py",
+                    "scripts/prepare_peptide_training_data.py",
+                )
+            },
+        }
     manifest_path = args.output_dir / "manifest.json"
     if manifest_path.exists():
         old = read_json(manifest_path)
@@ -132,6 +142,10 @@ def prepare(args):
         }
         try:
             job, reference = prepare_case(path, msa_map)
+            if "training_alignment" in signature:
+                from scripts.evaluation.peptide_training_aligned import align_peptide_inputs
+
+                job, reference = align_peptide_inputs(job, reference, args.reference_seed)
             validate_case(job, reference)
             input_path = args.output_dir / "inputs" / f"{path.stem}.json"
             ref_path = args.output_dir / "references" / f"{path.stem}.json"
@@ -616,6 +630,9 @@ def score_case(args, case, run, record, cached=None):
                 "input_reader": file_hash(
                     Path(__file__).with_name("peptide_pose_inputs.py")
                 ),
+                "training_aligned_scorer": file_hash(
+                    Path(__file__).with_name("peptide_training_aligned.py")
+                ),
             }
         )
         reference = read_json(ref_path)
@@ -660,6 +677,12 @@ def score_case(args, case, run, record, cached=None):
                     not args.no_atom_symmetry,
                     args.min_receptor_coverage,
                 )
+                if reference.get("prediction_atom_mapping"):
+                    from scripts.evaluation.peptide_training_aligned import epitope_ca_score
+
+                    result["epitope_ca_rmsd"] = epitope_ca_score(
+                        reference, read_prediction(path), args.min_receptor_coverage
+                    )
                 peptides = result.pop("peptides")
                 report["poses"].append(
                     {**identity, "ranking_score": confidence, **result}
@@ -789,6 +812,13 @@ def score(args, manifest, cached_reports=None):
         "run": run,
     }
     write_json(output / "summary.json", summary)
+    if "training_alignment" in manifest.get("signature", {}):
+        from scripts.evaluation.peptide_training_aligned import epitope_summary
+
+        epitope = epitope_summary(manifest["cases"], pose_rows, expected)
+        write_json(output / "epitope_ca_summary.json", epitope)
+        write_csv(output / "epitope_ca_summary.csv", [epitope["table"]])
+        print(json.dumps(epitope["table"], indent=2), flush=True)
     print(
         json.dumps({k: v for k, v in summary.items() if k != "run"}, indent=2),
         flush=True,
@@ -805,6 +835,11 @@ def main():
         default="all",
     )
     parser.add_argument("--input-dir", type=Path, default=Path(DEFAULT_INPUT))
+    parser.add_argument(
+        "--peptide-representation", choices=("ccd", "training-aligned"), default="ccd",
+        help="Use one custom ligand residue and a whole-peptide reference, as in training",
+    )
+    parser.add_argument("--reference-seed", type=int, default=42, help="Training reference-conformer seed")
     parser.add_argument(
         "--output-dir", type=Path, default=REPO.parent / "peptide_pose_eval_v2"
     )

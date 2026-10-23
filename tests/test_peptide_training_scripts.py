@@ -33,8 +33,10 @@ if HAS_CHEMISTRY:
     import biotite.structure as struc
     import numpy as np
     from biotite.structure.io.pdbx import CIFCategory
+    from rdkit import Chem
 
     from protenix.data.core.featurizer import Featurizer
+    from protenix.data.pipeline import peptide_repair
     from protenix.data.tokenizer import Token
     from scripts import prepare_peptide_training_data as preparation
 
@@ -123,6 +125,187 @@ class PeptidePreparationTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "endpoint"):
             preparation.restore_explicit_bonds(parser, atoms)
+
+    def test_imidazolium_hydrogens_preserve_charge_and_connectivity(self):
+        template = Chem.MolFromSmiles("c1[nH+]cc[nH]1")
+        template.atom_map = {str(i): i for i in range(template.GetNumAtoms())}
+        mol = Chem.Mol(template)
+        for atom in mol.GetAtoms():
+            atom.SetNumExplicitHs(0)
+        atoms = struc.AtomArray(5)
+        atoms.element = np.array([a.GetSymbol() for a in mol.GetAtoms()])
+        atoms.coord[:, 0] = np.arange(5)
+        original = SimpleNamespace(
+            match=lambda coord, element: ("A", "1", "HIS", str(int(coord[0])), "1")
+        )
+        with patch.object(
+            peptide_repair.ccd, "get_component_rdkit_mol", return_value=template
+        ):
+            inferred = peptide_repair.repair_aromatic_hydrogens(
+                mol, atoms, np.arange(5), original
+            )
+        Chem.SanitizeMol(mol)
+        self.assertEqual(inferred, [1, 4])
+        self.assertEqual(Chem.MolToSmiles(mol), Chem.MolToSmiles(template))
+
+    def test_failed_embedding_retries_with_independent_initialization(self):
+        atoms = self.make_atoms()
+        embed = preparation.AllChem.EmbedMolecule
+        calls = []
+
+        def fail_once(mol, options):
+            calls.append((options.randomSeed, options.useRandomCoords))
+            return -1 if len(calls) == 1 else embed(mol, options)
+
+        with patch.object(preparation.AllChem, "EmbedMolecule", side_effect=fail_once):
+            mol, _ = preparation.make_reference(atoms, np.arange(3), seed=42)
+        self.assertEqual(calls, [(42, True), (43, False)])
+        self.assertEqual(mol.embedding_attempts[0]["result"], -1)
+        self.assertEqual(mol.embedding_attempts[1]["result"], 0)
+        self.assertTrue(np.isfinite(mol.GetConformer().GetPositions()).all())
+
+    def test_failed_embeddings_never_fall_back_to_native_coordinates(self):
+        atoms = self.make_atoms()
+        with patch.object(
+            preparation.AllChem, "EmbedMolecule", return_value=-1
+        ) as embed:
+            with self.assertRaisesRegex(
+                ValueError, "reference conformer generation failed"
+            ):
+                preparation.make_reference(atoms, np.arange(3), seed=42)
+        self.assertEqual(embed.call_count, 2)
+
+    def test_atom_name_repair_handles_collisions_and_bond_endpoints(self):
+        site = CIFCategory(
+            {
+                "label_asym_id": ["B", "B"],
+                "label_seq_id": ["1", "1"],
+                "label_comp_id": ["APA", "APA"],
+                "label_atom_id": ["C1", "C1_2"],
+                "auth_atom_id": ["C1", "C1_2"],
+                "type_symbol": ["C", "C"],
+                "Cartn_x": ["0", "1"],
+                "Cartn_y": ["0", "0"],
+                "Cartn_z": ["0", "0"],
+            }
+        )
+        conn = {}
+        for n, atom in ((1, "C1"), (2, "C1_2")):
+            for field, value in zip(
+                ("asym_id", "seq_id", "comp_id", "atom_id"), ("B", "1", "APA", atom)
+            ):
+                conn[f"ptnr{n}_label_{field}"] = [value]
+        parser = SimpleNamespace(
+            cif=SimpleNamespace(
+                block={"atom_site": site, "struct_conn": CIFCategory(conn)}
+            )
+        )
+        original = SimpleNamespace(
+            match=lambda coord, element, residue: (
+                "A",
+                "1",
+                "APA",
+                ["C1'", "C1"][int(coord[0])],
+                "1",
+            )
+        )
+        with patch.object(
+            peptide_repair.ccd,
+            "get_component_rdkit_mol",
+            return_value=SimpleNamespace(atom_map={"C1": 0, "C1'": 1}),
+        ):
+            changes = peptide_repair.repair_atom_names(parser, original)
+        self.assertEqual(len(changes), 1)
+        self.assertEqual(
+            parser.cif.block["atom_site"]["label_atom_id"].as_array().tolist(),
+            ["C1'", "C1"],
+        )
+        self.assertEqual(
+            parser.cif.block["struct_conn"]["ptnr1_label_atom_id"].as_array().tolist(),
+            ["C1'"],
+        )
+
+    def test_ambiguous_original_names_fail_closed(self):
+        columns = {
+            "label_asym_id": ["B"],
+            "label_seq_id": ["1"],
+            "label_comp_id": ["APA"],
+            "label_atom_id": ["C1_2"],
+            "auth_atom_id": ["C1_2"],
+            "type_symbol": ["C"],
+            "Cartn_x": ["0"],
+            "Cartn_y": ["0"],
+            "Cartn_z": ["0"],
+        }
+        parser = SimpleNamespace(
+            cif=SimpleNamespace(block={"atom_site": CIFCategory(columns)})
+        )
+        with patch.object(
+            peptide_repair.ccd,
+            "get_component_rdkit_mol",
+            return_value=SimpleNamespace(atom_map={"C1'": 0}),
+        ):
+            with self.assertRaisesRegex(ValueError, "Cannot uniquely restore"):
+                peptide_repair.repair_atom_names(
+                    parser, SimpleNamespace(match=lambda *args: None)
+                )
+        self.assertEqual(
+            parser.cif.block["atom_site"]["label_atom_id"].as_array().tolist(), ["C1_2"]
+        )
+
+    def test_missing_centres_are_unresolved_without_dropping_observed_atoms(self):
+        atoms = self.make_atoms()
+        atoms.res_name[:] = "ALA"
+        atoms.atom_name = np.array(["N", "C", "O"])
+        atoms.element = np.array(["N", "C", "O"])
+        atoms.set_annotation("label_entity_id", np.array(["1"] * 3))
+        atoms.set_annotation("peptide_source_atom_index", np.arange(3))
+        template = struc.AtomArray(3)
+        template.atom_name = np.array(["N", "CA", "CB"])
+        template.element = np.array(["N", "C", "C"])
+        template.bonds = struc.BondList(3, np.array([[0, 1, 1], [1, 2, 1]]))
+        with patch.object(
+            peptide_repair.ccd, "get_component_atom_array", return_value=template
+        ):
+            result = peptide_repair.add_missing_representatives(
+                atoms, {"1": "polypeptide(L)"}
+            )
+        self.assertEqual(result.atom_name.tolist(), ["N", "C", "O", "CA", "CB"])
+        self.assertEqual(result.is_resolved.tolist(), [True, True, True, False, False])
+        self.assertEqual(result.peptide_source_atom_index.tolist(), [0, 1, 2, -1, -1])
+        np.testing.assert_array_equal(result.coord[:3], atoms.coord)
+        np.testing.assert_array_equal(result.coord[3:], 0)
+        self.assertEqual(len(result.bonds.as_array()), 4)
+
+    def test_reuse_retries_previously_failed_entries(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            old = root / "old"
+            output = root / "new"
+            for p in (old / "records", output / "records", output / "bioassembly"):
+                p.mkdir(parents=True)
+            source = root / "example.cif"
+            source.write_text("source")
+            preparation.write_json(
+                old / "records/example.json",
+                {"status": "failed", "error": "old failure"},
+            )
+
+            def convert(path, destination, seed, original):
+                destination.write_bytes(b"repaired")
+                return [{"pdb_id": "example"}], {"repaired": True}
+
+            with patch.object(preparation, "convert", side_effect=convert) as retry:
+                result = preparation.process_file(
+                    (
+                        source,
+                        output,
+                        {"reuse_prepared_dir": str(old), "seed": 42},
+                        False,
+                    )
+                )
+            self.assertEqual(result["status"], "ok")
+            retry.assert_called_once()
 
     def test_cache_detects_changed_source_and_corrupt_output(self):
         with tempfile.TemporaryDirectory() as folder:

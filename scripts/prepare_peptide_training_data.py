@@ -15,9 +15,10 @@
 """Prepare protein/PEP CIFs with custom peptide chemistry for finetuning.
 
 The converted CIFs omit polymer metadata and use PEP for arbitrary peptides.
-Preserve their observed atoms and explicit bonds, infer polymer metadata, and
-generate independent ligand reference conformers. No assembly expansion or
-completion of unobserved atoms is performed. Ordinary ligands use the CCD cache.
+Preserve their observed atoms and explicit bonds, recover full polymer sequences
+from the original PDB CIF, and generate independent ligand reference conformers.
+Missing polymer representative atoms are added as unresolved, masked placeholders.
+No assembly expansion or peptide atom completion is performed.
 """
 
 import argparse
@@ -32,14 +33,14 @@ import biotite.structure as struc
 import numpy as np
 import pandas as pd
 from biotite.structure.io.pdbx import CIFCategory
+from rdkit import Chem
+from rdkit.Chem import AllChem
 
 from configs.configs_data import data_configs
 from protenix.data.core import ccd
-from protenix.data.core.parser import DistillationMMCIFParser
+from protenix.data.pipeline import peptide_repair, peptide_sequence
 from protenix.data.tokenizer import AtomArrayTokenizer
-from protenix.utils.file_io import dump_gzip_pickle
-from rdkit import Chem
-from rdkit.Chem import AllChem
+from protenix.utils.file_io import dump_gzip_pickle, load_gzip_pickle
 
 
 def file_hash(path):
@@ -74,7 +75,7 @@ def atom_name(index, element):
     return element[0].upper() + suffix
 
 
-def add_polymer_metadata(parser):
+def add_polymer_metadata(parser, original=None):
     """Recover observed polymer sequences while leaving nonpolymer entities intact."""
     site = parser.cif.block["atom_site"]
     columns = {key: site[key].as_array() for key in site}
@@ -96,7 +97,9 @@ def add_polymer_metadata(parser):
         elif types == {"dna"}:
             polymers[entity] = "polydeoxyribonucleotide"
         else:
-            raise ValueError(f"Cannot infer polymer type for entity {entity}: {names}")
+            if original is None:
+                raise ValueError(f"Cannot infer polymer type for entity {entity}: {names}")
+            polymers[entity] = original.polymer_type(columns, mask)
         residues = {}
         for seq_id, name in zip(
             columns["label_seq_id"][mask], columns["label_comp_id"][mask]
@@ -175,7 +178,7 @@ def restore_explicit_bonds(parser, atoms):
     return explicit
 
 
-def make_reference(atoms, ids, seed):
+def make_reference(atoms, ids, seed, original=None):
     """Build a peptide reference from source chemistry and an independent conformer."""
     local = {int(atom_id): i for i, atom_id in enumerate(ids)}
     mol = Chem.RWMol()
@@ -201,35 +204,10 @@ def make_reference(atoms, ids, seed):
                 "A converted PEP has covalent bonds outside its residue; separate treatment is required"
             )
     mol = mol.GetMol()
-    # Heavy-atom CIFs omit the [nH] required by a neutral pyrrole/indole ring.
-    # Recover only the unambiguous single-nitrogen, five-membered carbon ring.
-    # Multiple-nitrogen rings (e.g. histidine) still require explicit chemistry.
-    mol.UpdatePropertyCache(strict=False)
-    inferred_hydrogens = []
-    for ring in Chem.GetSymmSSSR(mol):
-        ring = list(ring)
-        if sorted(mol.GetAtomWithIdx(i).GetAtomicNum() for i in ring) != [
-            6,
-            6,
-            6,
-            6,
-            7,
-        ]:
-            continue
-        if not all(
-            mol.GetBondBetweenAtoms(a, b).GetIsAromatic()
-            for a, b in zip(ring, ring[1:] + ring[:1])
-        ):
-            continue
-        nitrogen = next(
-            mol.GetAtomWithIdx(i)
-            for i in ring
-            if mol.GetAtomWithIdx(i).GetAtomicNum() == 7
-        )
-        if nitrogen.GetDegree() == 2 and nitrogen.GetFormalCharge() == 0:
-            nitrogen.SetNumExplicitHs(1)
-            nitrogen.SetNoImplicit(True)
-            inferred_hydrogens.append(names[nitrogen.GetIdx()])
+    inferred_hydrogens = [
+        names[i]
+        for i in peptide_repair.repair_aromatic_hydrogens(mol, atoms, ids, original)
+    ]
     Chem.SanitizeMol(mol)
     native = Chem.Conformer(len(ids))
     for i, atom_id in enumerate(ids):
@@ -239,27 +217,43 @@ def make_reference(atoms, ids, seed):
     Chem.AssignStereochemistryFrom3D(mol)
     mol.RemoveAllConformers()
     mol_h = Chem.AddHs(mol)
-    options = AllChem.ETKDGv3()
-    options.randomSeed = seed
-    options.numThreads = 1
-    options.useRandomCoords = True
-    options.maxIterations = 1000
-    if hasattr(options, "timeout"):
-        options.timeout = 120
-    if AllChem.EmbedMolecule(mol_h, options) < 0:
+    embedding_attempts = []
+    for attempt, random_coords in enumerate((True, False)):
+        options = AllChem.ETKDGv3()
+        options.randomSeed = (seed + attempt) % (2**31)
+        options.numThreads = 1
+        options.useRandomCoords = random_coords
+        options.maxIterations = 1000
+        if hasattr(options, "timeout"):
+            options.timeout = 120
+        result = AllChem.EmbedMolecule(mol_h, options)
+        embedding_attempts.append(
+            {"seed": options.randomSeed, "use_random_coords": random_coords, "result": result}
+        )
+        if result >= 0:
+            break
+    else:
         raise ValueError("RDKit reference conformer generation failed")
     mol = Chem.RemoveHs(mol_h)
     mol.atom_map = {name: i for i, name in enumerate(names)}
     mol.ref_conf_id = 0
     mol.ref_mask = np.ones(len(ids), dtype=bool)
     mol.inferred_hydrogen_atoms = inferred_hydrogens
+    mol.embedding_attempts = embedding_attempts
     return mol, names
 
 
-def convert(path, output, seed):
+def convert(path, output, seed, original_cif=None):
     """Convert one CIF and return peptide interface rows and preservation diagnostics."""
-    parser = DistillationMMCIFParser(mmcif_file=path)
-    add_polymer_metadata(parser)
+    if original_cif is None:
+        original_cif = (
+            Path(data_configs["weightedPDB_before2109_wopb_nometalc_0925"]["base_info"]["mmcif_dir"])
+            / f"{path.stem}.cif"
+        )
+    original = peptide_repair.OriginalAtoms(original_cif)
+    parser = peptide_repair.PeptideParser(mmcif_file=path)
+    name_repairs = peptide_repair.repair_atom_names(parser, original)
+    add_polymer_metadata(parser, original)
     atoms = parser.get_structure(bond_lenth_threshold=None)
     if atoms is None or len(atoms) != parser.cif.block["atom_site"].row_count:
         raise ValueError("Input must contain one model without alternate atom records")
@@ -284,7 +278,7 @@ def convert(path, output, seed):
         ids = np.flatnonzero(pep & (atoms.label_asym_id == chain))
         if len(set(atoms.res_id[ids])) != 1:
             raise ValueError("Multiple PEP residues in one chain are unsupported")
-        mol, names = make_reference(atoms, ids, seed)
+        mol, names = make_reference(atoms, ids, seed, original)
         # Pick an unused local identifier; custom references are passed explicitly.
         name = f"X{chain_number:02d}"
         if len(name) > 3 or name in set(atoms.res_name):
@@ -299,25 +293,30 @@ def convert(path, output, seed):
                 "bonds": mol.GetNumBonds(),
                 "smiles": Chem.MolToSmiles(mol),
                 "atom_name_mapping": dict(zip(atoms.atom_name[ids].tolist(), names)),
-                "inferred_pyrrole_hydrogen_atoms": mol.inferred_hydrogen_atoms,
+                "inferred_aromatic_hydrogen_atoms": mol.inferred_hydrogen_atoms,
+                "embedding_attempts": mol.embedding_attempts,
             }
         )
         atoms.res_name[ids] = name
         atoms.atom_name[ids] = names
     # Reuse the repository's annotation/index pipeline on our corrected structure.
     parser.get_structure = lambda: atoms.copy()
-    structure = parser.get_structure_dict(add_missing_atom=False, ccd_mols=custom_mols)
+    structure = parser.get_structure_dict(add_missing_atom=True, ccd_mols=custom_mols)
     aa = structure["atom_array"]
-    if aa is None or len(aa) != len(atoms):
+    if aa is None:
         raise ValueError("Structure processing removed source atoms")
     source_ids = aa.peptide_source_atom_index
-    if not np.array_equal(np.sort(source_ids), np.arange(len(atoms))):
+    observed_mask = source_ids >= 0
+    if not np.array_equal(np.sort(source_ids[observed_mask]), np.arange(len(atoms))):
         raise ValueError("Source atom identities changed")
-    if not np.array_equal(aa.coord, native_coord[source_ids]):
+    if not np.array_equal(aa.coord[observed_mask], native_coord[source_ids[observed_mask]]):
         raise ValueError("Source atom coordinates changed")
+    if not np.array_equal(aa.is_resolved, observed_mask) or np.any(aa.coord[~observed_mask] != 0):
+        raise ValueError("Missing representative atoms must remain unresolved and masked")
     observed = {
         tuple(sorted((int(source_ids[a]), int(source_ids[b])))): int(order)
         for a, b, order in aa.bonds.as_array()
+        if observed_mask[a] and observed_mask[b]
     }
     if any(observed.get(pair) != order for pair, order in explicit.items()):
         raise ValueError("Source bond connectivity or order changed")
@@ -350,6 +349,7 @@ def convert(path, output, seed):
     structure["pdb_id"] = path.stem
     for row in rows:
         row["pdb_id"] = path.stem
+    sequence_audit = peptide_sequence.recover_polymer_sequences(structure, original_cif)
     dump_gzip_pickle(structure, output, compression_level=3, atomic=True)
     return rows, {
         "atoms": len(aa),
@@ -359,8 +359,11 @@ def convert(path, output, seed):
         "resolution": parser.resolution,
         "ligands": ligands,
         "reference_method": "ETKDGv3; native coordinates discarded after stereo assignment",
-        "missing_atom_completion": False,
+        "missing_atom_completion": "unresolved polymer representatives only",
+        "added_unresolved_atoms": int((~observed_mask).sum()),
+        "atom_name_repairs": name_repairs,
         "assembly_expansion": False,
+        "polymer_sequence_recovery": sequence_audit,
     }
 
 
@@ -372,8 +375,14 @@ def process_file(task):
     signature = {
         "source": str(path),
         "source_sha256": file_hash(path),
-        "settings": settings,
+        "settings": {key: value for key, value in settings.items() if key != "reuse_prepared_dir"},
     }
+    original_cif = None
+    if settings.get("original_mmcif_dir"):
+        original_cif = Path(settings["original_mmcif_dir"]) / f"{path.stem}.cif"
+        signature["original_cif_sha256"] = (
+            file_hash(original_cif) if original_cif.is_file() else None
+        )
     if record_path.is_file():
         try:
             record = json.loads(record_path.read_text())
@@ -395,7 +404,31 @@ def process_file(task):
             "error": "Missing, stale, or corrupt prepared cache",
         }
     try:
-        rows, audit = convert(path, output, settings["seed"])
+        old = None
+        if settings.get("reuse_prepared_dir"):
+            old_root = Path(settings["reuse_prepared_dir"])
+            old_record = old_root / "records" / f"{path.stem}.json"
+            if old_record.is_file():
+                old = json.loads(old_record.read_text())
+        if old is not None and old["status"] == "ok":
+            if old["signature"]["source_sha256"] != signature["source_sha256"]:
+                raise ValueError("Source CIF differs from the cache being repaired")
+            if old["signature"]["settings"]["seed"] != settings["seed"]:
+                raise ValueError("Reference seed differs from the cache being repaired")
+            old_output = old_root / "bioassembly" / f"{path.stem}.pkl.gz"
+            if file_hash(old_output) != old["output_sha256"]:
+                raise ValueError("Corrupt cache being repaired")
+            structure = load_gzip_pickle(old_output)
+            sequence_audit = peptide_sequence.recover_polymer_sequences(structure, original_cif)
+            dump_gzip_pickle(structure, output, compression_level=3, atomic=True)
+            rows = old["rows"]
+            audit = {
+                **old["audit"],
+                "polymer_sequence_recovery": sequence_audit,
+                "reused_cache_sha256": old["output_sha256"],
+            }
+        else:
+            rows, audit = convert(path, output, settings["seed"], original_cif)
         record = {
             "status": "ok",
             "signature": signature,
@@ -421,6 +454,15 @@ def main():
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
+        "--original-mmcif-dir", type=Path,
+        default=Path(data_configs["weightedPDB_before2109_wopb_nometalc_0925"]["base_info"]["mmcif_dir"]),
+        help="Original PDB CIFs used to recover full polymer sequences and validate residue positions",
+    )
+    parser.add_argument(
+        "--reuse-prepared-dir", type=Path,
+        help="Reuse verified successful entries in a new output directory; retry rejected or missing entries",
+    )
+    parser.add_argument(
         "--ids", help="Optional comma-separated CIF stems for a small run"
     )
     parser.add_argument(
@@ -437,6 +479,10 @@ def main():
     if args.workers < 1 or not 0 <= args.seed < 2**31:
         parser.error("workers must be positive and seed must be in [0, 2**31)")
     source, root = args.input_dir.resolve(), args.output_dir.resolve()
+    if not args.original_mmcif_dir.is_dir():
+        parser.error("original-mmcif-dir must contain the original PDB CIFs")
+    if args.reuse_prepared_dir and args.reuse_prepared_dir.resolve() == root:
+        parser.error("Repair must write a separate output directory")
     files = sorted(source.glob("*.cif"))
     if args.ids:
         requested = set(args.ids.split(","))
@@ -457,6 +503,10 @@ def main():
     settings = {
         "script_sha256": file_hash(__file__),
         "seed": args.seed,
+        "original_mmcif_dir": str(args.original_mmcif_dir.resolve()),
+        "sequence_recovery_sha256": file_hash(peptide_sequence.__file__),
+        "peptide_repair_sha256": file_hash(peptide_repair.__file__),
+        "reuse_prepared_dir": str(args.reuse_prepared_dir.resolve()) if args.reuse_prepared_dir else None,
         "ccd": [
             {
                 "path": str(path),

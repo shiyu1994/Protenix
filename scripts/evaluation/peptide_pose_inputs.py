@@ -495,6 +495,10 @@ def validate_case(job, reference):
     atoms = parser.get_atom_array()
     tokens = AtomArrayTokenizer(atoms).get_token_array()
     predicted_keys = {(str(a.chain_id), int(a.res_id), str(a.atom_name)) for a in atoms}
+    if reference.get("prediction_atom_mapping"):
+        from scripts.evaluation.peptide_training_aligned import restore_prediction_keys
+
+        predicted_keys = set(restore_prediction_keys(dict.fromkeys(predicted_keys), reference))
     missing = [
         row[:4]
         for row in reference["atoms"]

@@ -1,5 +1,40 @@
 # Peptide finetuning with receptor MSAs
 
+## Full-sequence recovery for converted peptide data
+
+The peptide preprocessor now recovers complete polymer sequences from original
+PDB CIFs under `ORIGINAL_MMCIF_DIR` (default: `$PROTENIX_ROOT_DIR/mmcif`). It matches
+the original label chain, not the converted entity number, and validates every
+observed residue against its original sequence position. Renamed chains require
+a unique matching full sequence within the same PDB. Ambiguous or inconsistent
+mappings fail preparation. Internal missing residues and missing termini retain
+their original numbering; coordinates, bonds, ligand conformers, and tokenization
+are unchanged. This fixes both missed exact-sequence MSA lookups and shifted MSA
+columns. A directory alias for a shortened sequence is insufficient because A3M
+query validation requires the full query to match.
+
+To repair an existing cache without regenerating chemistry, write a separate
+cache directory:
+
+```bash
+PREP_REUSE_DIR=/path/to/existing/prepared \
+PREPARED_DIR=/path/to/repaired/prepared \
+ORIGINAL_MMCIF_DIR="$PROTENIX_ROOT_DIR/mmcif" \
+SKIP_PREP_ERRORS=1 bash preprocess_peptide.sh
+```
+
+Keep the original skip-errors policy and verify that **every previously accepted
+structure and interface row survives** before switching training to the repaired
+cache. `SKIP_PREP_ERRORS=1` alone does not establish that invariant. The repair
+checks source/cache hashes and preserves the accepted chemistry. Per-structure
+records include the original CIF hash, recovered original entities, and validated
+residue IDs. Changing an original CIF or recovery code invalidates its signature.
+The source cache is never overwritten. Subsequent `--check` calls do not need
+`PREP_REUSE_DIR`; use the same input, reference-CIF, seed, and CCD settings.
+
+The run and coverage descriptions below are historical and refer to the older
+observed-sequence caches.
+
 The active September 28 run uses the existing peptide preprocessing and training
 scripts, together with precomputed protein MSAs from the shared Protenix database.
 It was already running when this audit began; the audit preserves that job. No new

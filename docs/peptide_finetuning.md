@@ -143,6 +143,40 @@ invalid when any required backbone atom is absent, preserving the observed atoms
 and other supervision. Existing prepared files work with this fix and do not need
 to be regenerated.
 
+## Repair previously rejected conversions
+
+The converter now restores altered CCD atom names using a unique match to the
+original CIF's coordinates, element, and residue identity. It also recovers
+supported aromatic nitrogen hydrogens from valence and original CCD chemistry,
+and uses original polymer metadata for capped or modified chains. Ambiguous
+matches still fail rather than guessing atom identities or protonation.
+
+Missing standard-polymer centre/distogram atoms are added at zero coordinates
+with `is_resolved=False`, so they supply token metadata without becoming observed
+training targets. Existing coordinates and explicit bond orders are checked
+exactly. Peptide atoms are not completed, and the parser's optional arginine
+coordinate swap is disabled for these conversions. Reference conformers remain
+independently generated with ETKDGv3; a failed embedding gets one deterministic
+retry with a different initialization.
+
+To keep the current training cache intact and retry its rejected files:
+
+```bash
+PREP_REUSE_DIR=/mnt/project_abd/shiyu/peptide_msa_recovered_20261015 \
+PREPARED_DIR=/mnt/project_abd/shiyu/peptide_msa_repaired_20261020 \
+PREP_WORKERS=4 \
+SKIP_PREP_ERRORS=1 \
+bash preprocess_peptide.sh
+```
+
+`PREP_REUSE_DIR` reuses verified successful records and converts previously
+rejected or missing records with the repaired code. Omit it to regenerate every
+structure, including previously accepted ones. Use a fresh output directory.
+Per-record audits include atom-name repairs, inferred aromatic hydrogens,
+embedding attempts, and the count of added unresolved atoms. Review the new
+`preparation.json` and `failures.json` before choosing this cache for a new run;
+the command does not change any running job's dataset.
+
 ## Defaults
 
 | Setting | Default |

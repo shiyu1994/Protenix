@@ -161,6 +161,10 @@ def score_pose(
     reference, prediction, contact_cutoff=5.0, symmetry=True, min_receptor_coverage=0.9
 ):
     """Score every peptide with one consistent receptor/peptide chain assignment."""
+    if reference.get("prediction_atom_mapping"):
+        from scripts.evaluation.peptide_training_aligned import restore_prediction_keys
+
+        prediction = restore_prediction_keys(prediction, reference)
     chains = reference["chains"]
     receptor_rows = [
         r for r in reference["atoms"] if chains[r[0]]["role"] == "receptor"
